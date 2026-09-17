@@ -1,4 +1,5 @@
 import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.160.1/build/three.module.js";
+import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.160.1/examples/jsm/loaders/GLTFLoader.js";
 import { DEFAULT_ROOM } from "./gallery-config.js";
 
 const POINTER_SENSITIVITY = 0.005;
@@ -6,8 +7,39 @@ const MAX_PITCH_RADIANS = THREE.MathUtils.degToRad(80);
 const DRAG_THRESHOLD = 5;
 const DEFAULT_NORMAL = new THREE.Vector3(0, 0, 1);
 const FRAME_WIDTH_METRES = 0.07;
+const ROOM_MODEL_URL = new URL("./assets/rooms/gallery-room.glb", import.meta.url);
+const ROOM_MODEL_LIGHT_PROXY = /coronalight/i;
+const ROOM_MODEL_DETAIL = /door|line/i;
 
 const DEGREE = 180 / Math.PI;
+
+function createAbortError() {
+  const error = new Error("Gallery scene creation was cancelled.");
+  error.name = "AbortError";
+  return error;
+}
+
+function disposeLoadedRoomModel(model) {
+  const geometries = new Set();
+  const materials = new Set();
+  const textures = new Set();
+
+  model?.traverse((object) => {
+    if (!object.isMesh) return;
+    if (object.geometry) geometries.add(object.geometry);
+    const meshMaterials = Array.isArray(object.material) ? object.material : [object.material];
+    meshMaterials.filter(Boolean).forEach((material) => {
+      materials.add(material);
+      Object.values(material).forEach((value) => {
+        if (value?.isTexture) textures.add(value);
+      });
+    });
+  });
+
+  textures.forEach((texture) => texture.dispose());
+  materials.forEach((material) => material.dispose());
+  geometries.forEach((geometry) => geometry.dispose());
+}
 
 function normaliseDegrees(radians) {
   const value = (radians * DEGREE) % 360;
@@ -55,43 +87,20 @@ function artworkSize(work) {
   };
 }
 
-function artworkPlacements(works, roomWidth) {
-  const galleryWorks = Array.isArray(works) ? works : [];
-  const artworkCount = galleryWorks.length;
-  const slotsPerLongWall = Math.ceil(artworkCount / 2);
-  const sideMargin = 1;
-  const widestFrame = Math.max(
-    0,
-    ...galleryWorks.map((work) => artworkSize(work).width + FRAME_WIDTH_METRES * 2)
-  );
-  const usableWidth = Math.max(0, roomWidth - sideMargin * 2 - widestFrame);
-
-  return Array.from({ length: artworkCount }, (_, index) => {
-    const slot = Math.floor(index / 2);
-    const x = slotsPerLongWall <= 1
-      ? 0
-      : -usableWidth / 2 + (usableWidth * slot) / (slotsPerLongWall - 1);
-    return {
-      wall: index % 2 === 0 ? "far" : "entry",
-      x,
-      y: 1.48
-    };
-  });
-}
-
 /**
  * Creates the visual WebGL room and its camera controller.
  *
  * This module deliberately owns only the canvas and 3D interaction. Labels,
  * buttons, focus and live-region announcements remain in the parent UI.
  */
-export function createGalleryScene({
+export async function createGalleryScene({
   mount,
   works = [],
   room = DEFAULT_ROOM,
   artworkImage,
   onArtworkClick,
-  onStateChange
+  onStateChange,
+  signal
 } = {}) {
   if (!mount || typeof mount.append !== "function") {
     throw new TypeError("createGalleryScene needs a valid mount element.");
@@ -108,7 +117,19 @@ export function createGalleryScene({
   const CAMERA_FAR = Math.hypot(ROOM_WIDTH, ROOM_DEPTH, ROOM_HEIGHT) + 5;
   const WALL_LIMIT_X = ROOM_WIDTH / 2 - WALL_CLEARANCE;
   const WALL_LIMIT_Z = ROOM_DEPTH / 2 - WALL_CLEARANCE;
-  const ART_POSITIONS = artworkPlacements(galleryWorks, ROOM_WIDTH);
+  const ARTWORK_ANCHORS = Array.isArray(roomConfig.artworkAnchors) ? roomConfig.artworkAnchors : [];
+  const gltfLoader = new GLTFLoader();
+
+  if (galleryWorks.length > ARTWORK_ANCHORS.length) {
+    throw new RangeError(`The imported gallery has ${ARTWORK_ANCHORS.length} configured artwork anchors, but received ${galleryWorks.length} works.`);
+  }
+
+  if (signal?.aborted) throw createAbortError();
+  const { scene: importedRoomModel } = await gltfLoader.loadAsync(ROOM_MODEL_URL.href);
+  if (signal?.aborted || !mount.isConnected) {
+    disposeLoadedRoomModel(importedRoomModel);
+    throw createAbortError();
+  }
 
   const scene = new THREE.Scene();
   const roomBackgroundColor = new THREE.Color(0xd8d2c8);
@@ -139,13 +160,18 @@ export function createGalleryScene({
   const geometries = new Set();
   const materials = new Set();
   const artHitTargets = [];
+  const roomCollisionTargets = [];
   const controllableLights = [];
   const lightResponsiveMaterials = [];
   const raycaster = new THREE.Raycaster();
+  const wallRaycaster = new THREE.Raycaster();
+  const artworkAnchorRaycaster = new THREE.Raycaster();
   const pointer = new THREE.Vector2();
   const artworkTextures = new Set();
+  const modelTextures = new Set();
   const textureLoader = new THREE.TextureLoader();
   let floorTexture = null;
+  let roomModel = null;
   let positionX = Number.isFinite(roomConfig.startX) ? roomConfig.startX : 0;
   let positionZ = Number.isFinite(roomConfig.startZ) ? roomConfig.startZ : ROOM_DEPTH / 2 - 0.5;
   let yaw = 0;
@@ -155,10 +181,15 @@ export function createGalleryScene({
   let resizeObserver = null;
   let lightLevelPercent = 100;
 
+  function rememberMaterial(material) {
+    if (Array.isArray(material)) material.forEach((item) => rememberMaterial(item));
+    else if (material) materials.add(material);
+    return material;
+  }
+
   function rememberMesh(geometry, material) {
     geometries.add(geometry);
-    if (Array.isArray(material)) material.forEach((item) => materials.add(item));
-    else materials.add(material);
+    rememberMaterial(material);
     return new THREE.Mesh(geometry, material);
   }
 
@@ -197,29 +228,46 @@ export function createGalleryScene({
     return lightLevelPercent;
   }
 
-  function wallPlacement(placement) {
-    switch (placement.wall) {
-      case "entry":
-        return {
-          position: new THREE.Vector3(placement.x, placement.y, ROOM_DEPTH / 2),
-          normal: new THREE.Vector3(0, 0, -1)
-        };
-      case "left":
-        return {
-          position: new THREE.Vector3(-ROOM_WIDTH / 2, placement.y, placement.z),
-          normal: new THREE.Vector3(1, 0, 0)
-        };
-      case "right":
-        return {
-          position: new THREE.Vector3(ROOM_WIDTH / 2, placement.y, placement.z),
-          normal: new THREE.Vector3(-1, 0, 0)
-        };
-      default:
-        return {
-          position: new THREE.Vector3(placement.x, placement.y, -ROOM_DEPTH / 2),
-          normal: new THREE.Vector3(0, 0, 1)
-        };
+  function readArtworkAnchor(anchor, index) {
+    const label = anchor?.id || `slot-${index + 1}`;
+    const position = Array.isArray(anchor?.position) ? new THREE.Vector3(...anchor.position) : null;
+    const normal = Array.isArray(anchor?.normal) ? new THREE.Vector3(...anchor.normal) : null;
+
+    if (!position?.toArray().every(Number.isFinite) || !normal?.toArray().every(Number.isFinite) || normal.lengthSq() === 0) {
+      throw new TypeError(`Artwork anchor ${label} is invalid.`);
     }
+
+    return { anchor, label, position, normal: normal.normalize() };
+  }
+
+  function resolveArtworkPlacement(work, index) {
+    const { anchor, label, position, normal } = readArtworkAnchor(ARTWORK_ANCHORS[index], index);
+    const { width, height } = artworkSize(work);
+    const framedWidth = width + FRAME_WIDTH_METRES * 2;
+    const framedHeight = height + FRAME_WIDTH_METRES * 2;
+    const maxFrameWidth = Number(anchor.maxFrameWidthM);
+    const maxFrameHeight = Number(anchor.maxFrameHeightM);
+
+    if (!Number.isFinite(maxFrameWidth) || !Number.isFinite(maxFrameHeight)) {
+      throw new TypeError(`Artwork anchor ${label} has no valid frame dimensions.`);
+    }
+
+    if (framedWidth > maxFrameWidth || framedHeight > maxFrameHeight) {
+      throw new RangeError(`Artwork ${index + 1} does not fit ${label}.`);
+    }
+
+    const targetWalls = roomCollisionTargets.filter((object) => object.name === anchor.wall);
+    artworkAnchorRaycaster.set(position.clone().addScaledVector(normal, 0.12), normal.clone().negate());
+    artworkAnchorRaycaster.near = 0.001;
+    artworkAnchorRaycaster.far = 0.2;
+    const hit = artworkAnchorRaycaster.intersectObjects(targetWalls, false)[0];
+    const hitNormal = hit?.face?.normal?.clone().transformDirection(hit.object.matrixWorld);
+
+    if (!hit || !hitNormal || hitNormal.dot(normal) < 0.98) {
+      throw new Error(`Artwork anchor ${label} no longer matches the ${anchor.wall} wall in the imported model.`);
+    }
+
+    return { work, position, normal, width, height };
   }
 
   function syncCamera() {
@@ -272,28 +320,59 @@ export function createGalleryScene({
     return x >= -WALL_LIMIT_X && x <= WALL_LIMIT_X && z >= -WALL_LIMIT_Z && z <= WALL_LIMIT_Z;
   }
 
-  function canMove(direction) {
-    const vector = movementVector(direction);
-    return Boolean(vector) && isClear(positionX + vector.x * STEP_METRES, positionZ + vector.z * STEP_METRES);
+  function isBlockedByRoomGeometry(vector) {
+    if (!roomCollisionTargets.length) return false;
+
+    const direction = new THREE.Vector3(vector.x, 0, vector.z).normalize();
+    const lateral = new THREE.Vector3(-direction.z, 0, direction.x);
+    const shoulderClearance = Math.min(Math.max(WALL_CLEARANCE, 0.18), 0.28);
+    const travelDistance = STEP_METRES + shoulderClearance;
+    const shoulderHeight = Math.min(EYE_HEIGHT * 0.72, ROOM_HEIGHT - 0.25);
+    const origin = new THREE.Vector3();
+    const offsets = [-shoulderClearance, 0, shoulderClearance];
+
+    return offsets.some((offset) => {
+      origin.set(positionX, shoulderHeight, positionZ).addScaledVector(lateral, offset);
+      wallRaycaster.set(origin, direction);
+      wallRaycaster.near = 0.06;
+      wallRaycaster.far = travelDistance;
+      const hit = wallRaycaster.intersectObjects(roomCollisionTargets, false).find((intersection) => {
+        const normal = intersection.face?.normal?.clone().transformDirection(intersection.object.matrixWorld);
+        return normal && Math.abs(normal.y) < 0.45;
+      });
+      return Boolean(hit);
+    });
   }
 
-  function getState() {
-    return {
+  function canMove(direction) {
+    const vector = movementVector(direction);
+    return Boolean(vector)
+      && isClear(positionX + vector.x * STEP_METRES, positionZ + vector.z * STEP_METRES)
+      && !isBlockedByRoomGeometry(vector);
+  }
+
+  function getState(includeMovementAvailability = true) {
+    const state = {
       x: rounded(positionX),
       z: rounded(positionZ),
       headingDegrees: Math.round(headingForYaw(yaw)) % 360,
       pitchDegrees: Math.round(pitch * DEGREE),
       lightLevelPercent,
-      direction: directionForYaw(yaw),
-      canForward: canMove("forward"),
-      canBack: canMove("back"),
-      canLeft: canMove("left"),
-      canRight: canMove("right")
+      direction: directionForYaw(yaw)
     };
+
+    if (includeMovementAvailability) {
+      state.canForward = canMove("forward");
+      state.canBack = canMove("back");
+      state.canLeft = canMove("left");
+      state.canRight = canMove("right");
+    }
+
+    return state;
   }
 
-  function emit(type, moved, message) {
-    onStateChange?.({ type, moved, state: getState(), message });
+  function emit(type, moved, message, includeMovementAvailability = true) {
+    onStateChange?.({ type, moved, state: getState(includeMovementAvailability), message });
   }
 
   function createGalleryTileTexture() {
@@ -342,79 +421,97 @@ export function createGalleryScene({
     return texture;
   }
 
-  function addRoom() {
-    const wallMaterial = new THREE.MeshStandardMaterial({ color: 0xebe4d9, roughness: 0.92, metalness: 0 });
-    const floorMaterial = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.23, metalness: 0 });
+  function rememberModelMaterial(material) {
+    const items = Array.isArray(material) ? material : [material];
+    items.filter(Boolean).forEach((item) => {
+      rememberMaterial(item);
+      Object.values(item).forEach((value) => {
+        if (value?.isTexture) modelTextures.add(value);
+      });
+    });
+  }
+
+  function roomModelBounds(model) {
+    const bounds = new THREE.Box3();
+    const meshBounds = new THREE.Box3();
+    model.updateMatrixWorld(true);
+
+    model.traverse((object) => {
+      if (!object.isMesh || ROOM_MODEL_LIGHT_PROXY.test(object.name) || !object.geometry) return;
+      object.geometry.computeBoundingBox();
+      if (!object.geometry.boundingBox) return;
+      meshBounds.copy(object.geometry.boundingBox).applyMatrix4(object.matrixWorld);
+      bounds.union(meshBounds);
+    });
+
+    return bounds;
+  }
+
+  function addRoomModel(importedModel) {
+    const surfaceMaterial = rememberMaterial(new THREE.MeshStandardMaterial({
+      color: 0xf1eee7,
+      roughness: 0.8,
+      metalness: 0,
+      side: THREE.DoubleSide
+    }));
+    const detailMaterial = rememberMaterial(new THREE.MeshStandardMaterial({
+      color: 0x6c6256,
+      roughness: 0.58,
+      metalness: 0.08,
+      side: THREE.DoubleSide
+    }));
+
+    importedModel.name = "imported-gallery-room";
+    importedModel.traverse((object) => {
+      if (!object.isMesh) return;
+      geometries.add(object.geometry);
+      rememberModelMaterial(object.material);
+
+      if (ROOM_MODEL_LIGHT_PROXY.test(object.name)) {
+        object.visible = false;
+        return;
+      }
+
+      object.material = ROOM_MODEL_DETAIL.test(object.name) ? detailMaterial : surfaceMaterial;
+      object.castShadow = true;
+      object.receiveShadow = true;
+      roomCollisionTargets.push(object);
+    });
+
+    const bounds = roomModelBounds(importedModel);
+    if (bounds.isEmpty()) {
+      throw new Error("The imported gallery model has no visible room geometry.");
+    }
+
+    const center = bounds.getCenter(new THREE.Vector3());
+    importedModel.position.x -= center.x;
+    importedModel.position.y -= bounds.min.y;
+    importedModel.position.z -= center.z;
+    importedModel.updateMatrixWorld(true);
+    roomModel = importedModel;
+    scene.add(roomModel);
+  }
+
+  function addRoomEnvelope() {
+    const floorMaterial = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.23, metalness: 0, side: THREE.DoubleSide });
     const ceilingMaterial = rememberLightResponsiveMaterial(new THREE.MeshBasicMaterial({ color: 0xf7f1e7, side: THREE.DoubleSide, toneMapped: false }), 0x3a332b);
-    const ceilingInsetMaterial = rememberLightResponsiveMaterial(new THREE.MeshBasicMaterial({ color: 0xe8dfd2, toneMapped: false }), 0x302b25);
-    const baseboardMaterial = new THREE.MeshStandardMaterial({ color: 0xd8d1c5, roughness: 0.74, metalness: 0 });
-    const corniceMaterial = new THREE.MeshStandardMaterial({ color: 0xf4ede2, roughness: 0.9, metalness: 0 });
 
     floorTexture = createGalleryTileTexture();
     floorMaterial.map = floorTexture;
 
-    const farWall = rememberMesh(new THREE.PlaneGeometry(ROOM_WIDTH, ROOM_HEIGHT), wallMaterial);
-    farWall.position.set(0, ROOM_HEIGHT / 2, -ROOM_DEPTH / 2);
-    scene.add(farWall);
-
-    const entryWall = rememberMesh(new THREE.PlaneGeometry(ROOM_WIDTH, ROOM_HEIGHT), wallMaterial);
-    entryWall.position.set(0, ROOM_HEIGHT / 2, ROOM_DEPTH / 2);
-    entryWall.rotation.y = Math.PI;
-    scene.add(entryWall);
-
-    const leftWall = rememberMesh(new THREE.PlaneGeometry(ROOM_DEPTH, ROOM_HEIGHT), wallMaterial);
-    leftWall.position.set(-ROOM_WIDTH / 2, ROOM_HEIGHT / 2, 0);
-    leftWall.rotation.y = Math.PI / 2;
-    scene.add(leftWall);
-
-    const rightWall = rememberMesh(new THREE.PlaneGeometry(ROOM_DEPTH, ROOM_HEIGHT), wallMaterial);
-    rightWall.position.set(ROOM_WIDTH / 2, ROOM_HEIGHT / 2, 0);
-    rightWall.rotation.y = -Math.PI / 2;
-    scene.add(rightWall);
-
     const floor = rememberMesh(new THREE.PlaneGeometry(ROOM_WIDTH, ROOM_DEPTH), floorMaterial);
     floor.rotation.x = -Math.PI / 2;
-    floor.position.y = -0.005;
+    floor.position.y = -0.04;
+    floor.receiveShadow = true;
     scene.add(floor);
 
     const ceiling = rememberMesh(new THREE.PlaneGeometry(ROOM_WIDTH, ROOM_DEPTH), ceilingMaterial);
-    ceiling.position.y = ROOM_HEIGHT;
+    ceiling.position.y = ROOM_HEIGHT + 0.04;
     ceiling.rotation.x = Math.PI / 2;
     scene.add(ceiling);
-
-    const ceilingInset = rememberMesh(new THREE.BoxGeometry(ROOM_WIDTH - 0.52, 0.035, ROOM_DEPTH - 0.45), ceilingInsetMaterial);
-    ceilingInset.position.set(0, ROOM_HEIGHT - 0.018, 0);
-    scene.add(ceilingInset);
-
-    const longBaseboard = new THREE.BoxGeometry(ROOM_WIDTH, 0.13, 0.07);
-    const sideBaseboard = new THREE.BoxGeometry(0.07, 0.13, ROOM_DEPTH);
-    const longCornice = new THREE.BoxGeometry(ROOM_WIDTH, 0.16, 0.12);
-    const sideCornice = new THREE.BoxGeometry(0.12, 0.16, ROOM_DEPTH);
-
-    [
-      [longBaseboard, 0, 0.065, -ROOM_DEPTH / 2 + 0.035],
-      [longBaseboard, 0, 0.065, ROOM_DEPTH / 2 - 0.035],
-      [sideBaseboard, -ROOM_WIDTH / 2 + 0.035, 0.065, 0],
-      [sideBaseboard, ROOM_WIDTH / 2 - 0.035, 0.065, 0]
-    ].forEach(([geometry, x, y, z]) => {
-      const trim = rememberMesh(geometry, baseboardMaterial);
-      trim.position.set(x, y, z);
-      scene.add(trim);
-    });
-
-    [
-      [longCornice, 0, ROOM_HEIGHT - 0.08, -ROOM_DEPTH / 2 + 0.06],
-      [longCornice, 0, ROOM_HEIGHT - 0.08, ROOM_DEPTH / 2 - 0.06],
-      [sideCornice, -ROOM_WIDTH / 2 + 0.06, ROOM_HEIGHT - 0.08, 0],
-      [sideCornice, ROOM_WIDTH / 2 - 0.06, ROOM_HEIGHT - 0.08, 0]
-    ].forEach(([geometry, x, y, z]) => {
-      const trim = rememberMesh(geometry, corniceMaterial);
-      trim.position.set(x, y, z);
-      scene.add(trim);
-    });
   }
 
-  function addLights() {
+  function addLights(artworkPlacements) {
     scene.add(rememberLight(new THREE.HemisphereLight(0xfff8ee, 0xc9c3b8, 1.25)));
 
     const keyLight = rememberLight(new THREE.DirectionalLight(0xfff2dc, 2));
@@ -466,19 +563,16 @@ export function createGalleryScene({
       });
     });
 
-    ART_POSITIONS.forEach((placement) => {
-      const isEntryWall = placement.wall === "entry";
+    artworkPlacements.forEach(({ position, normal }) => {
       const spotlight = rememberLight(new THREE.SpotLight(0xffe7c7, 7, 7, THREE.MathUtils.degToRad(24), 0.52, 1.3));
-      spotlight.position.set(placement.x, ROOM_HEIGHT - 0.34, isEntryWall ? 0.78 : -0.78);
-      spotlight.target.position.set(placement.x, placement.y, isEntryWall ? ROOM_DEPTH / 2 - 0.05 : -ROOM_DEPTH / 2 + 0.05);
+      spotlight.position.copy(position).addScaledVector(normal, 0.78);
+      spotlight.position.y = ROOM_HEIGHT - 0.34;
+      spotlight.target.position.copy(position);
       scene.add(spotlight, spotlight.target);
     });
   }
 
-  function addArtwork(work, index) {
-    const placement = ART_POSITIONS[index] || { wall: "far", x: 0, y: 1.48 };
-    const { position, normal } = wallPlacement(placement);
-    const { width, height } = artworkSize(work);
+  function addArtwork({ work, position, normal, width, height }) {
     const group = new THREE.Group();
     const frameDepth = 0.055;
     const frameWidth = FRAME_WIDTH_METRES;
@@ -535,7 +629,7 @@ export function createGalleryScene({
     pointer.x = ((clientX - bounds.left) / bounds.width) * 2 - 1;
     pointer.y = -((clientY - bounds.top) / bounds.height) * 2 + 1;
     raycaster.setFromCamera(pointer, camera);
-    const hit = raycaster.intersectObjects(artHitTargets, false)[0];
+    const hit = raycaster.intersectObjects([...roomCollisionTargets, ...artHitTargets], false)[0];
     const work = hit?.object?.userData?.work;
     if (work) onArtworkClick?.(work);
   }
@@ -568,7 +662,7 @@ export function createGalleryScene({
     );
     syncCamera();
     render();
-    emit("look", false);
+    emit("look", false, undefined, false);
   }
 
   function clearActivePointer(pointerId) {
@@ -662,16 +756,20 @@ export function createGalleryScene({
     geometries.forEach((geometry) => geometry.dispose());
     materials.forEach((material) => material.dispose());
     floorTexture?.dispose();
+    modelTextures.forEach((texture) => texture.dispose());
     artworkTextures.forEach((texture) => texture.dispose());
+    roomModel?.removeFromParent();
     renderer.dispose();
     renderer.forceContextLoss?.();
     canvas.remove();
   }
 
   try {
-    addRoom();
-    addLights();
-    galleryWorks.forEach(addArtwork);
+    addRoomModel(importedRoomModel);
+    const resolvedArtworkPlacements = galleryWorks.map(resolveArtworkPlacement);
+    addRoomEnvelope();
+    addLights(resolvedArtworkPlacements);
+    resolvedArtworkPlacements.forEach(addArtwork);
     syncCamera();
 
     resizeObserver = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(resize);

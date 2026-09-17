@@ -1,4 +1,4 @@
-import { createRoomForArtworkCount } from "./gallery-config.js";
+import { MODEL_ROOM } from "./gallery-config.js";
 
 const importedArtworkFiles = Object.freeze([
   { fileName: "ayten-01.jpg", sourceName: "IMG_1156.jpg", widthPx: 2048, heightPx: 1531 },
@@ -42,11 +42,12 @@ const artist = {
 
 const artistGalleryRoute = `/gallery/${artist.slug}`;
 const legacyArtistGalleryRoutes = new Set(["/gallery/leila-mirzaeva"]);
-const room = createRoomForArtworkCount(artist.works.length);
+const room = MODEL_ROOM;
 
 const app = document.querySelector("#app");
 let galleryScene = null;
 let gallerySceneRevision = 0;
+let gallerySceneAbortController = null;
 let artworkOpener = null;
 let closeWorksDrawer = () => {};
 const MAP_INSET_PERCENT = 14;
@@ -80,6 +81,8 @@ function mapPosition(value, dimension) {
 
 function disposeGalleryScene() {
   gallerySceneRevision += 1;
+  gallerySceneAbortController?.abort();
+  gallerySceneAbortController = null;
   galleryScene?.dispose();
   galleryScene = null;
 }
@@ -121,6 +124,7 @@ function updateCameraUi({ state, message = "" } = {}) {
     { direction: "left", stateKey: "canLeft", label: "Влево", wall: "слева стена" },
     { direction: "right", stateKey: "canRight", label: "Вправо", wall: "справа стена" }
   ].forEach(({ direction, stateKey, label, wall }) => {
+    if (!(stateKey in state)) return;
     const button = document.querySelector(`[data-direction="${direction}"]`);
     const canMove = Boolean(state[stateKey]);
     button?.toggleAttribute("data-blocked", !canMove);
@@ -136,36 +140,52 @@ function runGalleryAction(direction) {
   else galleryScene.move(direction);
 }
 
+function setGalleryControlsEnabled(enabled) {
+  document.querySelectorAll("[data-direction]").forEach((button) => {
+    button.disabled = !enabled;
+  });
+  const lightSlider = document.querySelector("#room-light-level");
+  if (lightSlider) lightSlider.disabled = !enabled;
+}
+
 async function mountGalleryScene(mount, stage, revision) {
+  const abortController = new AbortController();
+  gallerySceneAbortController = abortController;
   try {
     const { createGalleryScene } = await import("./gallery-scene.js");
-    if (revision !== gallerySceneRevision || !mount.isConnected) return;
+    if (revision !== gallerySceneRevision || abortController.signal.aborted || !mount.isConnected) return;
 
     const scene = await createGalleryScene({
       mount,
       works: artist.works,
       room,
+      signal: abortController.signal,
       onArtworkClick: (work) => openArtwork(work, stage),
       onStateChange: (payload) => {
         if (revision === gallerySceneRevision) updateCameraUi(payload);
       }
     });
 
-    if (revision !== gallerySceneRevision || !mount.isConnected) {
+    if (revision !== gallerySceneRevision || abortController.signal.aborted || !mount.isConnected) {
       scene.dispose();
       return;
     }
 
     galleryScene = scene;
+    if (gallerySceneAbortController === abortController) gallerySceneAbortController = null;
+    setGalleryControlsEnabled(true);
     setGalleryLightLevel(galleryLightLevel);
     mount.querySelector("p")?.remove();
     mount.classList.remove("is-loading");
     stage.removeAttribute("aria-busy");
     updateCameraUi({ state: scene.getState() });
   } catch (error) {
-    if (revision !== gallerySceneRevision || !mount.isConnected) return;
+    if (revision !== gallerySceneRevision || abortController.signal.aborted || !mount.isConnected) return;
+    if (gallerySceneAbortController === abortController) gallerySceneAbortController = null;
+    setGalleryControlsEnabled(false);
     mount.classList.remove("is-loading");
-    mount.innerHTML = '<p class="scene-load-error">Не удалось загрузить 3D-зал. Обновите страницу и попробуйте снова.</p>';
+    mount.removeAttribute("aria-hidden");
+    mount.innerHTML = '<p class="scene-load-error" role="alert">Не удалось загрузить 3D-зал. Обновите страницу и попробуйте снова.</p>';
     stage.removeAttribute("aria-busy");
     document.querySelector("#camera-status").textContent = "3D-зал не загрузился. Попробуйте обновить страницу.";
     console.error("Gallery scene failed to load", error);
@@ -293,19 +313,19 @@ function renderGallery() {
       </header>
       <div class="gallery-stage" tabindex="0" aria-busy="true" aria-describedby="scene-instructions" aria-label="Виртуальный зал ${artist.name}" style="--room-map-aspect: ${mapAspect} / 1">
         <div class="scene-host is-loading" id="scene-host" aria-hidden="true"><p>Загрузка 3D-зала…</p></div>
-        <div class="scene-caption"><p>Комната ${room.widthM} × ${room.depthM} м</p><strong id="scene-position">Загрузка…</strong><span id="scene-direction">Шаг 1 м · обзор 360°</span></div>
+        <div class="scene-caption"><p>Комната ${formatMetres(room.widthM)} × ${formatMetres(room.depthM)} м</p><strong id="scene-position">Загрузка…</strong><span id="scene-direction">Шаг 1 м · обзор 360°</span></div>
         <div class="lighting-control">
           <label for="room-light-level">Свет в зале <output id="room-light-value" for="room-light-level">${galleryLightLevel}%</output></label>
-          <input id="room-light-level" type="range" min="0" max="100" step="1" value="${galleryLightLevel}" aria-valuetext="${galleryLightLevel}%" aria-describedby="room-light-hint" />
+          <input id="room-light-level" type="range" min="0" max="100" step="1" value="${galleryLightLevel}" aria-valuetext="${galleryLightLevel}%" aria-describedby="room-light-hint" disabled />
           <span id="room-light-hint" class="sr-only">Регулирует яркость освещения в виртуальном зале.</span>
         </div>
-        <p id="scene-instructions" class="sr-only">Размер комнаты: ${room.widthM} × ${room.depthM} м. Стрелка вверх или W делает шаг вперёд на один метр, вниз или S — назад. Влево и вправо, либо A и D, делают боковой шаг на один метр относительно взгляда. Q и E поворачивают взгляд на пятнадцать градусов. Мышью или пальцем можно смотреть влево, вправо, вверх и вниз. Клавиши R и F наклоняют взгляд вверх и вниз; шаг при этом остаётся по полу. Ползунок «Свет в зале» регулирует освещение комнаты.</p>
+        <p id="scene-instructions" class="sr-only">Размер комнаты: ${formatMetres(room.widthM)} × ${formatMetres(room.depthM)} м. Стрелка вверх или W делает шаг вперёд на один метр, вниз или S — назад. Влево и вправо, либо A и D, делают боковой шаг на один метр относительно взгляда. Q и E поворачивают взгляд на пятнадцать градусов. Мышью или пальцем можно смотреть влево, вправо, вверх и вниз. Клавиши R и F наклоняют взгляд вверх и вниз; шаг при этом остаётся по полу. Ползунок «Свет в зале» регулирует освещение комнаты.</p>
         <p id="camera-status" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p>
         <nav class="navigation" aria-label="Перемещение по залу">
-          <button class="nav-button" type="button" data-direction="forward" aria-label="Вперёд, шаг 1 метр">↑</button>
-          <button class="nav-button" type="button" data-direction="left" aria-label="Влево, шаг 1 метр">←</button>
-          <button class="nav-button" type="button" data-direction="back" aria-label="Назад, шаг 1 метр">↓</button>
-          <button class="nav-button" type="button" data-direction="right" aria-label="Вправо, шаг 1 метр">→</button>
+          <button class="nav-button" type="button" data-direction="forward" aria-label="Вперёд, шаг 1 метр" disabled>↑</button>
+          <button class="nav-button" type="button" data-direction="left" aria-label="Влево, шаг 1 метр" disabled>←</button>
+          <button class="nav-button" type="button" data-direction="back" aria-label="Назад, шаг 1 метр" disabled>↓</button>
+          <button class="nav-button" type="button" data-direction="right" aria-label="Вправо, шаг 1 метр" disabled>→</button>
         </nav>
         <div class="room-map" aria-hidden="true"><span class="map-label map-label-far">Стена</span><span class="map-label map-label-entry">Вход</span><span class="map-cursor"></span></div>
         <aside class="works-drawer" id="works-drawer" hidden aria-label="Список из ${artist.works.length} работ">
