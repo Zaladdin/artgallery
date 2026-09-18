@@ -1,4 +1,4 @@
-import { MODEL_ROOM } from "./gallery-config.js";
+import { createRoomForArtworkCount } from "./gallery-config.js";
 
 const importedArtworkFiles = Object.freeze([
   { fileName: "ayten-01.jpg", sourceName: "IMG_1156.jpg", widthPx: 2048, heightPx: 1531 },
@@ -42,7 +42,7 @@ const artist = {
 
 const artistGalleryRoute = `/gallery/${artist.slug}`;
 const legacyArtistGalleryRoutes = new Set(["/gallery/leila-mirzaeva"]);
-const room = MODEL_ROOM;
+const room = createRoomForArtworkCount(artist.works.length);
 
 const app = document.querySelector("#app");
 let galleryScene = null;
@@ -107,16 +107,21 @@ function updateCameraUi({ state, message = "" } = {}) {
   const stage = document.querySelector(".gallery-stage");
   if (!stage) return;
 
-  const fromLeftWall = state.x + room.widthM / 2;
-  const fromEntrance = room.depthM / 2 - state.z;
+  const fromEntrance = state.x + room.widthM / 2;
+  const fromLeftWall = state.z + room.depthM / 2;
+  const mapX = state.isMoving && Number.isFinite(state.targetX) ? state.targetX : state.x;
+  const mapZ = state.isMoving && Number.isFinite(state.targetZ) ? state.targetZ : state.z;
+  const mapFromEntrance = mapX + room.widthM / 2;
+  const mapFromLeftWall = mapZ + room.depthM / 2;
   const heading = Math.round(state.headingDegrees) % 360;
   const pitch = Math.round(state.pitchDegrees || 0);
   const verticalLook = Math.abs(pitch) < 1 ? "" : ` · ${pitch > 0 ? "вверх" : "вниз"} ${Math.abs(pitch)}°`;
-  document.querySelector("#scene-position").textContent = `X ${formatMetres(fromLeftWall)} м · от входа ${formatMetres(fromEntrance)} м`;
+  document.querySelector("#scene-position").textContent = `Точка обзора: ${formatMetres(fromEntrance)} м от входа`;
   document.querySelector("#scene-direction").textContent = `Взгляд: ${state.direction} · ${heading}°${verticalLook}`;
-  stage.style.setProperty("--map-x", `${mapPosition(fromLeftWall, room.widthM)}%`);
-  stage.style.setProperty("--map-z", `${mapPosition(state.z + room.depthM / 2, room.depthM)}%`);
+  stage.style.setProperty("--map-x", `${mapPosition(mapFromEntrance, room.widthM)}%`);
+  stage.style.setProperty("--map-z", `${mapPosition(mapFromLeftWall, room.depthM)}%`);
   stage.style.setProperty("--map-heading", `${heading}deg`);
+  stage.toggleAttribute("data-moving", Boolean(state.isMoving));
 
   [
     { direction: "forward", stateKey: "canForward", label: "Вперёд", wall: "впереди стена" },
@@ -126,9 +131,11 @@ function updateCameraUi({ state, message = "" } = {}) {
   ].forEach(({ direction, stateKey, label, wall }) => {
     if (!(stateKey in state)) return;
     const button = document.querySelector(`[data-direction="${direction}"]`);
-    const canMove = Boolean(state[stateKey]);
-    button?.toggleAttribute("data-blocked", !canMove);
-    button?.setAttribute("aria-label", canMove ? `${label}, шаг 1 метр` : `${label}: ${wall}`);
+    if (!button) return;
+    const canMove = !state.isMoving && Boolean(state[stateKey]);
+    button.setAttribute("aria-disabled", String(Boolean(state.isMoving)));
+    button.toggleAttribute("data-blocked", !canMove);
+    button.setAttribute("aria-label", state.isMoving ? "Выполняется перемещение" : canMove ? `${label}, шаг 1 метр` : `${label}: ${wall}`);
   });
   if (message) document.querySelector("#camera-status").textContent = message;
 }
@@ -313,13 +320,13 @@ function renderGallery() {
       </header>
       <div class="gallery-stage" tabindex="0" aria-busy="true" aria-describedby="scene-instructions" aria-label="Виртуальный зал ${artist.name}" style="--room-map-aspect: ${mapAspect} / 1">
         <div class="scene-host is-loading" id="scene-host" aria-hidden="true"><p>Загрузка 3D-зала…</p></div>
-        <div class="scene-caption"><p>Комната ${formatMetres(room.widthM)} × ${formatMetres(room.depthM)} м</p><strong id="scene-position">Загрузка…</strong><span id="scene-direction">Шаг 1 м · обзор 360°</span></div>
+        <div class="scene-caption"><p>Зал: длина ${formatMetres(room.widthM)} м · ширина ${formatMetres(room.depthM)} м</p><strong id="scene-position">Загрузка…</strong><span id="scene-direction">Шаг 1 м · обзор 360°</span></div>
         <div class="lighting-control">
-          <label for="room-light-level">Свет в зале <output id="room-light-value" for="room-light-level">${galleryLightLevel}%</output></label>
+          <label for="room-light-level">Общий свет в зале <output id="room-light-value" for="room-light-level">${galleryLightLevel}%</output></label>
           <input id="room-light-level" type="range" min="0" max="100" step="1" value="${galleryLightLevel}" aria-valuetext="${galleryLightLevel}%" aria-describedby="room-light-hint" disabled />
-          <span id="room-light-hint" class="sr-only">Регулирует яркость освещения в виртуальном зале.</span>
+          <span id="room-light-hint" class="sr-only">Регулирует общий свет в виртуальном зале. Прожекторы над картинами остаются включёнными.</span>
         </div>
-        <p id="scene-instructions" class="sr-only">Размер комнаты: ${formatMetres(room.widthM)} × ${formatMetres(room.depthM)} м. Стрелка вверх или W делает шаг вперёд на один метр, вниз или S — назад. Влево и вправо, либо A и D, делают боковой шаг на один метр относительно взгляда. Q и E поворачивают взгляд на пятнадцать градусов. Мышью или пальцем можно смотреть влево, вправо, вверх и вниз. Клавиши R и F наклоняют взгляд вверх и вниз; шаг при этом остаётся по полу. Ползунок «Свет в зале» регулирует освещение комнаты.</p>
+        <p id="scene-instructions" class="sr-only">Размер комнаты: ${formatMetres(room.widthM)} × ${formatMetres(room.depthM)} м. Стрелка вверх или W делает плавный шаг вперёд на один метр, вниз или S — назад. Влево и вправо, либо A и D, делают боковой шаг на один метр относительно взгляда. Q и E поворачивают взгляд на пятнадцать градусов. Мышью или пальцем можно смотреть влево, вправо, вверх и вниз. Клавиши R и F наклоняют взгляд вверх и вниз; шаг при этом остаётся по полу. Ползунок «Общий свет в зале» регулирует освещение комнаты, но прожекторы над картинами остаются включёнными.</p>
         <p id="camera-status" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p>
         <nav class="navigation" aria-label="Перемещение по залу">
           <button class="nav-button" type="button" data-direction="forward" aria-label="Вперёд, шаг 1 метр" disabled>↑</button>

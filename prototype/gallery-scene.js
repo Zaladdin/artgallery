@@ -1,5 +1,4 @@
 import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.160.1/build/three.module.js";
-import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.160.1/examples/jsm/loaders/GLTFLoader.js";
 import { DEFAULT_ROOM } from "./gallery-config.js";
 
 const POINTER_SENSITIVITY = 0.005;
@@ -7,9 +6,9 @@ const MAX_PITCH_RADIANS = THREE.MathUtils.degToRad(80);
 const DRAG_THRESHOLD = 5;
 const DEFAULT_NORMAL = new THREE.Vector3(0, 0, 1);
 const FRAME_WIDTH_METRES = 0.07;
-const ROOM_MODEL_URL = new URL("./assets/rooms/gallery-room.glb", import.meta.url);
-const ROOM_MODEL_LIGHT_PROXY = /coronalight/i;
-const ROOM_MODEL_DETAIL = /door|line/i;
+const MIN_ARTWORK_SPOTLIGHT_FACTOR = 1;
+const MIN_ARTWORK_LENS_FACTOR = 1;
+const MOVEMENT_DURATION_MS = 280;
 
 const DEGREE = 180 / Math.PI;
 
@@ -17,28 +16,6 @@ function createAbortError() {
   const error = new Error("Gallery scene creation was cancelled.");
   error.name = "AbortError";
   return error;
-}
-
-function disposeLoadedRoomModel(model) {
-  const geometries = new Set();
-  const materials = new Set();
-  const textures = new Set();
-
-  model?.traverse((object) => {
-    if (!object.isMesh) return;
-    if (object.geometry) geometries.add(object.geometry);
-    const meshMaterials = Array.isArray(object.material) ? object.material : [object.material];
-    meshMaterials.filter(Boolean).forEach((material) => {
-      materials.add(material);
-      Object.values(material).forEach((value) => {
-        if (value?.isTexture) textures.add(value);
-      });
-    });
-  });
-
-  textures.forEach((texture) => texture.dispose());
-  materials.forEach((material) => material.dispose());
-  geometries.forEach((geometry) => geometry.dispose());
 }
 
 function normaliseDegrees(radians) {
@@ -56,11 +33,11 @@ function rounded(value) {
 }
 
 function directionForYaw(yaw) {
-  const degrees = headingForYaw(yaw);
-  if (degrees >= 315 || degrees < 45) return "к дальней стене";
-  if (degrees < 135) return "к правой стене";
-  if (degrees < 225) return "к входу";
-  return "к левой стене";
+  const x = -Math.sin(yaw);
+  const z = -Math.cos(yaw);
+  if (x > 0.707) return "к дальней стене";
+  if (x < -0.707) return "к входу";
+  return z < 0 ? "к левой стене" : "к правой стене";
 }
 
 function lookDescription(yaw, pitch) {
@@ -118,22 +95,16 @@ export async function createGalleryScene({
   const WALL_LIMIT_X = ROOM_WIDTH / 2 - WALL_CLEARANCE;
   const WALL_LIMIT_Z = ROOM_DEPTH / 2 - WALL_CLEARANCE;
   const ARTWORK_ANCHORS = Array.isArray(roomConfig.artworkAnchors) ? roomConfig.artworkAnchors : [];
-  const gltfLoader = new GLTFLoader();
 
   if (galleryWorks.length > ARTWORK_ANCHORS.length) {
-    throw new RangeError(`The imported gallery has ${ARTWORK_ANCHORS.length} configured artwork anchors, but received ${galleryWorks.length} works.`);
+    throw new RangeError(`The gallery has ${ARTWORK_ANCHORS.length} configured artwork anchors, but received ${galleryWorks.length} works.`);
   }
 
   if (signal?.aborted) throw createAbortError();
-  const { scene: importedRoomModel } = await gltfLoader.loadAsync(ROOM_MODEL_URL.href);
-  if (signal?.aborted || !mount.isConnected) {
-    disposeLoadedRoomModel(importedRoomModel);
-    throw createAbortError();
-  }
 
   const scene = new THREE.Scene();
-  const roomBackgroundColor = new THREE.Color(0xd8d2c8);
-  const dimRoomBackgroundColor = new THREE.Color(0x282521);
+  const roomBackgroundColor = new THREE.Color(0xe9e4da);
+  const dimRoomBackgroundColor = new THREE.Color(0x49443e);
   scene.background = roomBackgroundColor.clone();
 
   const camera = new THREE.PerspectiveCamera(63, 1, 0.05, CAMERA_FAR);
@@ -141,11 +112,9 @@ export async function createGalleryScene({
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
-  const fullLightExposure = 1.05;
-  const dimLightExposure = 0.28;
+  const fullLightExposure = 1.04;
   renderer.toneMappingExposure = fullLightExposure;
-  renderer.shadowMap.enabled = true;
-  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.shadowMap.enabled = false;
 
   const canvas = renderer.domElement;
   canvas.className = "gallery-scene-canvas";
@@ -168,18 +137,19 @@ export async function createGalleryScene({
   const artworkAnchorRaycaster = new THREE.Raycaster();
   const pointer = new THREE.Vector2();
   const artworkTextures = new Set();
-  const modelTextures = new Set();
   const textureLoader = new THREE.TextureLoader();
   let floorTexture = null;
-  let roomModel = null;
   let positionX = Number.isFinite(roomConfig.startX) ? roomConfig.startX : 0;
   let positionZ = Number.isFinite(roomConfig.startZ) ? roomConfig.startZ : ROOM_DEPTH / 2 - 0.5;
-  let yaw = 0;
+  let yaw = Number.isFinite(roomConfig.startYawRadians) ? roomConfig.startYawRadians : 0;
   let pitch = 0;
   let activePointer = null;
   let disposed = false;
   let resizeObserver = null;
   let lightLevelPercent = 100;
+  let isMoving = false;
+  let movementAnimationFrame = null;
+  let movementTarget = null;
 
   function rememberMaterial(material) {
     if (Array.isArray(material)) material.forEach((item) => rememberMaterial(item));
@@ -193,16 +163,21 @@ export async function createGalleryScene({
     return new THREE.Mesh(geometry, material);
   }
 
-  function rememberLight(light) {
-    controllableLights.push({ light, baseIntensity: light.intensity });
+  function rememberLight(light, minimumIntensityFactor = 0) {
+    controllableLights.push({
+      light,
+      baseIntensity: light.intensity,
+      minimumIntensityFactor: THREE.MathUtils.clamp(minimumIntensityFactor, 0, 1)
+    });
     return light;
   }
 
-  function rememberLightResponsiveMaterial(material, dimColor) {
+  function rememberLightResponsiveMaterial(material, dimColor, minimumLightFactor = 0) {
     lightResponsiveMaterials.push({
       material,
       baseColor: material.color.clone(),
-      dimColor: new THREE.Color(dimColor)
+      dimColor: new THREE.Color(dimColor),
+      minimumLightFactor: THREE.MathUtils.clamp(minimumLightFactor, 0, 1)
     });
     return material;
   }
@@ -216,14 +191,15 @@ export async function createGalleryScene({
     lightLevelPercent = Math.round(THREE.MathUtils.clamp(Number.isFinite(numericPercent) ? numericPercent : 100, 0, 100));
     const intensityFactor = lightLevelPercent / 100;
 
-    controllableLights.forEach(({ light, baseIntensity }) => {
-      light.intensity = baseIntensity * intensityFactor;
+    controllableLights.forEach(({ light, baseIntensity, minimumIntensityFactor }) => {
+      const adjustedIntensityFactor = THREE.MathUtils.lerp(minimumIntensityFactor, 1, intensityFactor);
+      light.intensity = baseIntensity * adjustedIntensityFactor;
     });
-    lightResponsiveMaterials.forEach(({ material, baseColor, dimColor }) => {
-      material.color.lerpColors(dimColor, baseColor, intensityFactor);
+    lightResponsiveMaterials.forEach(({ material, baseColor, dimColor, minimumLightFactor }) => {
+      const adjustedColorFactor = THREE.MathUtils.lerp(minimumLightFactor, 1, intensityFactor);
+      material.color.lerpColors(dimColor, baseColor, adjustedColorFactor);
     });
     scene.background.lerpColors(dimRoomBackgroundColor, roomBackgroundColor, intensityFactor);
-    renderer.toneMappingExposure = THREE.MathUtils.lerp(dimLightExposure, fullLightExposure, intensityFactor);
     render();
     return lightLevelPercent;
   }
@@ -261,10 +237,9 @@ export async function createGalleryScene({
     artworkAnchorRaycaster.near = 0.001;
     artworkAnchorRaycaster.far = 0.2;
     const hit = artworkAnchorRaycaster.intersectObjects(targetWalls, false)[0];
-    const hitNormal = hit?.face?.normal?.clone().transformDirection(hit.object.matrixWorld);
 
-    if (!hit || !hitNormal || hitNormal.dot(normal) < 0.98) {
-      throw new Error(`Artwork anchor ${label} no longer matches the ${anchor.wall} wall in the imported model.`);
+    if (!hit) {
+      throw new Error(`Artwork anchor ${label} does not match the ${anchor.wall} wall.`);
     }
 
     return { work, position, normal, width, height };
@@ -273,6 +248,16 @@ export async function createGalleryScene({
   function syncCamera() {
     camera.position.set(positionX, EYE_HEIGHT, positionZ);
     camera.rotation.set(pitch, yaw, 0, "YXZ");
+  }
+
+  function prefersReducedMotion() {
+    return Boolean(window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches);
+  }
+
+  function easedMovement(progress) {
+    return progress < 0.5
+      ? 4 * progress * progress * progress
+      : 1 - ((-2 * progress + 2) ** 3) / 2;
   }
 
   function forwardVector() {
@@ -358,14 +343,17 @@ export async function createGalleryScene({
       headingDegrees: Math.round(headingForYaw(yaw)) % 360,
       pitchDegrees: Math.round(pitch * DEGREE),
       lightLevelPercent,
+      isMoving,
+      targetX: movementTarget?.x,
+      targetZ: movementTarget?.z,
       direction: directionForYaw(yaw)
     };
 
     if (includeMovementAvailability) {
-      state.canForward = canMove("forward");
-      state.canBack = canMove("back");
-      state.canLeft = canMove("left");
-      state.canRight = canMove("right");
+      state.canForward = !isMoving && canMove("forward");
+      state.canBack = !isMoving && canMove("back");
+      state.canLeft = !isMoving && canMove("left");
+      state.canRight = !isMoving && canMove("right");
     }
 
     return state;
@@ -375,39 +363,64 @@ export async function createGalleryScene({
     onStateChange?.({ type, moved, state: getState(includeMovementAvailability), message });
   }
 
-  function createGalleryTileTexture() {
+  function createGalleryWoodFloorTexture() {
     const textureCanvas = document.createElement("canvas");
     textureCanvas.width = 1024;
     textureCanvas.height = 1024;
     const context = textureCanvas.getContext("2d");
     if (!context) return null;
 
-    const tilesPerSide = 8;
-    const tileSize = textureCanvas.width / tilesPerSide;
-    const tileShades = ["#f7f4ed", "#f3efe6", "#eee9df", "#f5f1e9"];
+    const boardCount = 40;
+    const boardWidth = textureCanvas.width / boardCount;
+    const boardShades = ["#d8ab70", "#c8965c", "#e1bc82", "#b9854e", "#d1a269", "#e7c28c"];
+    const seamColor = "rgba(84, 52, 28, .2)";
 
-    context.fillStyle = "#d9d2c6";
+    context.fillStyle = "#c9935a";
     context.fillRect(0, 0, textureCanvas.width, textureCanvas.height);
 
-    for (let row = 0; row < tilesPerSide; row += 1) {
-      for (let column = 0; column < tilesPerSide; column += 1) {
-        const x = column * tileSize;
-        const y = row * tileSize;
-        const shadeIndex = (row * 3 + column * 5) % tileShades.length;
-        const gradient = context.createLinearGradient(x, y, x + tileSize, y + tileSize);
-        gradient.addColorStop(0, "#fbf9f4");
-        gradient.addColorStop(0.52, tileShades[shadeIndex]);
-        gradient.addColorStop(1, "#e9e3d8");
-        context.fillStyle = gradient;
-        context.fillRect(x + 1, y + 1, tileSize - 2, tileSize - 2);
+    for (let board = 0; board < boardCount; board += 1) {
+      const x = board * boardWidth;
+      const offset = (board * 173) % 314;
+      const segmentHeights = [338, 426, 292, 484];
+      let y = -offset;
+      let segment = 0;
 
-        context.strokeStyle = "rgba(175, 165, 151, .11)";
+      while (y < textureCanvas.height) {
+        const height = segmentHeights[(board + segment * 3) % segmentHeights.length];
+        const shade = boardShades[(board * 5 + segment * 2) % boardShades.length];
+        const gradient = context.createLinearGradient(x, y, x + boardWidth, y + height);
+        gradient.addColorStop(0, "#f0cf9d");
+        gradient.addColorStop(0.22, shade);
+        gradient.addColorStop(0.78, shade);
+        gradient.addColorStop(1, "#a87445");
+        context.fillStyle = gradient;
+        context.fillRect(x + 1, y + 1, boardWidth - 2, height - 2);
+
+        context.strokeStyle = seamColor;
+        context.lineWidth = 2;
+        context.beginPath();
+        context.moveTo(x, y);
+        context.lineTo(x + boardWidth, y);
+        context.stroke();
+
+        y += height;
+        segment += 1;
+      }
+
+      context.strokeStyle = "rgba(84, 52, 28, .28)";
+      context.lineWidth = 1.4;
+      context.beginPath();
+      context.moveTo(x, 0);
+      context.lineTo(x, textureCanvas.height);
+      context.stroke();
+
+      for (let grain = 0; grain < 4; grain += 1) {
+        const grainX = x + boardWidth * ((grain + 1) / 5);
+        context.strokeStyle = "rgba(103, 65, 39, .14)";
         context.lineWidth = 1;
         context.beginPath();
-        context.moveTo(x + tileSize * 0.14, y + tileSize * 0.73);
-        context.lineTo(x + tileSize * 0.76, y + tileSize * 0.69);
-        context.moveTo(x + tileSize * 0.31, y + tileSize * 0.27);
-        context.lineTo(x + tileSize * 0.88, y + tileSize * 0.31);
+        context.moveTo(grainX, 0);
+        context.bezierCurveTo(grainX - 8, 260, grainX + 8, 620, grainX - 3, textureCanvas.height);
         context.stroke();
       }
     }
@@ -416,158 +429,187 @@ export async function createGalleryScene({
     texture.colorSpace = THREE.SRGBColorSpace;
     texture.wrapS = THREE.RepeatWrapping;
     texture.wrapT = THREE.RepeatWrapping;
-    texture.repeat.set(Math.max(1, ROOM_WIDTH / 4), Math.max(1, ROOM_DEPTH / 4));
+    texture.repeat.set(1, 1);
+    texture.center.set(0.5, 0.5);
+    texture.rotation = Math.PI / 2;
     texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
     return texture;
   }
 
-  function rememberModelMaterial(material) {
-    const items = Array.isArray(material) ? material : [material];
-    items.filter(Boolean).forEach((item) => {
-      rememberMaterial(item);
-      Object.values(item).forEach((value) => {
-        if (value?.isTexture) modelTextures.add(value);
-      });
-    });
-  }
-
-  function roomModelBounds(model) {
-    const bounds = new THREE.Box3();
-    const meshBounds = new THREE.Box3();
-    model.updateMatrixWorld(true);
-
-    model.traverse((object) => {
-      if (!object.isMesh || ROOM_MODEL_LIGHT_PROXY.test(object.name) || !object.geometry) return;
-      object.geometry.computeBoundingBox();
-      if (!object.geometry.boundingBox) return;
-      meshBounds.copy(object.geometry.boundingBox).applyMatrix4(object.matrixWorld);
-      bounds.union(meshBounds);
-    });
-
-    return bounds;
-  }
-
-  function addRoomModel(importedModel) {
-    const surfaceMaterial = rememberMaterial(new THREE.MeshStandardMaterial({
+  function addRoomShell() {
+    const wallThickness = 0.12;
+    const wallMaterial = rememberLightResponsiveMaterial(new THREE.MeshStandardMaterial({
       color: 0xf1eee7,
-      roughness: 0.8,
+      roughness: 0.84,
+      metalness: 0
+    }), 0x716b63);
+    const floorMaterial = rememberMaterial(new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      emissive: 0x1c0d03,
+      emissiveIntensity: 0.06,
+      roughness: 0.56,
       metalness: 0,
       side: THREE.DoubleSide
     }));
-    const detailMaterial = rememberMaterial(new THREE.MeshStandardMaterial({
-      color: 0x6c6256,
-      roughness: 0.58,
-      metalness: 0.08,
-      side: THREE.DoubleSide
-    }));
+    const ceilingMaterial = rememberLightResponsiveMaterial(new THREE.MeshBasicMaterial({
+      color: 0xf9f6ef,
+      side: THREE.DoubleSide,
+      toneMapped: false
+    }), 0x605b54);
+    const trimMaterial = rememberLightResponsiveMaterial(new THREE.MeshStandardMaterial({
+      color: 0xd9d4ca,
+      roughness: 0.66,
+      metalness: 0
+    }), 0x615c54);
 
-    importedModel.name = "imported-gallery-room";
-    importedModel.traverse((object) => {
-      if (!object.isMesh) return;
-      geometries.add(object.geometry);
-      rememberModelMaterial(object.material);
-
-      if (ROOM_MODEL_LIGHT_PROXY.test(object.name)) {
-        object.visible = false;
-        return;
-      }
-
-      object.material = ROOM_MODEL_DETAIL.test(object.name) ? detailMaterial : surfaceMaterial;
-      object.castShadow = true;
-      object.receiveShadow = true;
-      roomCollisionTargets.push(object);
-    });
-
-    const bounds = roomModelBounds(importedModel);
-    if (bounds.isEmpty()) {
-      throw new Error("The imported gallery model has no visible room geometry.");
-    }
-
-    const center = bounds.getCenter(new THREE.Vector3());
-    importedModel.position.x -= center.x;
-    importedModel.position.y -= bounds.min.y;
-    importedModel.position.z -= center.z;
-    importedModel.updateMatrixWorld(true);
-    roomModel = importedModel;
-    scene.add(roomModel);
-  }
-
-  function addRoomEnvelope() {
-    const floorMaterial = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.23, metalness: 0, side: THREE.DoubleSide });
-    const ceilingMaterial = rememberLightResponsiveMaterial(new THREE.MeshBasicMaterial({ color: 0xf7f1e7, side: THREE.DoubleSide, toneMapped: false }), 0x3a332b);
-
-    floorTexture = createGalleryTileTexture();
+    floorTexture = createGalleryWoodFloorTexture();
     floorMaterial.map = floorTexture;
 
     const floor = rememberMesh(new THREE.PlaneGeometry(ROOM_WIDTH, ROOM_DEPTH), floorMaterial);
+    floor.name = "gallery-floor";
     floor.rotation.x = -Math.PI / 2;
-    floor.position.y = -0.04;
-    floor.receiveShadow = true;
+    floor.position.y = 0.006;
+    floor.receiveShadow = false;
     scene.add(floor);
 
     const ceiling = rememberMesh(new THREE.PlaneGeometry(ROOM_WIDTH, ROOM_DEPTH), ceilingMaterial);
-    ceiling.position.y = ROOM_HEIGHT + 0.04;
+    ceiling.name = "gallery-ceiling";
+    ceiling.position.y = ROOM_HEIGHT;
     ceiling.rotation.x = Math.PI / 2;
     scene.add(ceiling);
+
+    function addWall(name, geometry, position) {
+      const wall = rememberMesh(geometry, wallMaterial);
+      wall.name = name;
+      wall.position.copy(position);
+      wall.castShadow = false;
+      wall.receiveShadow = false;
+      roomCollisionTargets.push(wall);
+      scene.add(wall);
+    }
+
+    addWall("wall-left", new THREE.BoxGeometry(ROOM_WIDTH, ROOM_HEIGHT, wallThickness), new THREE.Vector3(0, ROOM_HEIGHT / 2, -ROOM_DEPTH / 2));
+    addWall("wall-right", new THREE.BoxGeometry(ROOM_WIDTH, ROOM_HEIGHT, wallThickness), new THREE.Vector3(0, ROOM_HEIGHT / 2, ROOM_DEPTH / 2));
+    addWall("wall-entry", new THREE.BoxGeometry(wallThickness, ROOM_HEIGHT, ROOM_DEPTH), new THREE.Vector3(-ROOM_WIDTH / 2, ROOM_HEIGHT / 2, 0));
+    addWall("wall-far", new THREE.BoxGeometry(wallThickness, ROOM_HEIGHT, ROOM_DEPTH), new THREE.Vector3(ROOM_WIDTH / 2, ROOM_HEIGHT / 2, 0));
+
+    const baseboardHeight = 0.1;
+    const baseboardDepth = 0.035;
+    const sideBaseboardGeometry = new THREE.BoxGeometry(ROOM_WIDTH, baseboardHeight, baseboardDepth);
+    const endBaseboardGeometry = new THREE.BoxGeometry(baseboardDepth, baseboardHeight, ROOM_DEPTH);
+    const corniceHeight = 0.075;
+    const sideCorniceGeometry = new THREE.BoxGeometry(ROOM_WIDTH, corniceHeight, 0.09);
+    const endCorniceGeometry = new THREE.BoxGeometry(0.09, corniceHeight, ROOM_DEPTH);
+
+    [
+      [sideBaseboardGeometry, 0, baseboardHeight / 2, -ROOM_DEPTH / 2 + baseboardDepth / 2],
+      [sideBaseboardGeometry, 0, baseboardHeight / 2, ROOM_DEPTH / 2 - baseboardDepth / 2],
+      [endBaseboardGeometry, -ROOM_WIDTH / 2 + baseboardDepth / 2, baseboardHeight / 2, 0],
+      [endBaseboardGeometry, ROOM_WIDTH / 2 - baseboardDepth / 2, baseboardHeight / 2, 0],
+      [sideCorniceGeometry, 0, ROOM_HEIGHT - corniceHeight / 2, -ROOM_DEPTH / 2 + 0.045],
+      [sideCorniceGeometry, 0, ROOM_HEIGHT - corniceHeight / 2, ROOM_DEPTH / 2 - 0.045],
+      [endCorniceGeometry, -ROOM_WIDTH / 2 + 0.045, ROOM_HEIGHT - corniceHeight / 2, 0],
+      [endCorniceGeometry, ROOM_WIDTH / 2 - 0.045, ROOM_HEIGHT - corniceHeight / 2, 0]
+    ].forEach(([geometry, x, y, z]) => {
+      const trim = rememberMesh(geometry, trimMaterial);
+      trim.position.set(x, y, z);
+      trim.receiveShadow = false;
+      scene.add(trim);
+    });
+
+    scene.updateMatrixWorld(true);
   }
 
   function addLights(artworkPlacements) {
-    scene.add(rememberLight(new THREE.HemisphereLight(0xfff8ee, 0xc9c3b8, 1.25)));
+    scene.add(rememberLight(new THREE.HemisphereLight(0xfffbf4, 0xc3b49f, 0.85)));
 
-    const keyLight = rememberLight(new THREE.DirectionalLight(0xfff2dc, 2));
+    const keyLight = rememberLight(new THREE.DirectionalLight(0xfff1d9, 0.26));
     keyLight.position.set(-ROOM_WIDTH * 0.28, ROOM_HEIGHT * 0.92, ROOM_DEPTH * 0.7);
     keyLight.target.position.set(0, 1.25, -ROOM_DEPTH * 0.28);
-    keyLight.castShadow = true;
-    keyLight.shadow.mapSize.set(1024, 1024);
-    const shadowSpan = Math.max(ROOM_WIDTH, ROOM_DEPTH) * 0.66;
-    keyLight.shadow.camera.left = -shadowSpan;
-    keyLight.shadow.camera.right = shadowSpan;
-    keyLight.shadow.camera.top = shadowSpan;
-    keyLight.shadow.camera.bottom = -shadowSpan;
-    keyLight.shadow.camera.far = CAMERA_FAR * 2;
-    keyLight.shadow.camera.updateProjectionMatrix();
+    keyLight.castShadow = false;
     scene.add(keyLight, keyLight.target);
 
-    const fillLight = rememberLight(new THREE.DirectionalLight(0xdde7ff, 0.48));
+    const fillLight = rememberLight(new THREE.DirectionalLight(0xe0e8f1, 0.12));
     fillLight.position.set(ROOM_WIDTH * 0.32, ROOM_HEIGHT * 0.76, -ROOM_DEPTH * 0.5);
     fillLight.target.position.set(0, 1.4, 0);
     scene.add(fillLight, fillLight.target);
 
-    const trackMaterial = new THREE.MeshStandardMaterial({ color: 0x1e1d1a, roughness: 0.36, metalness: 0.62 });
-    const fixtureMaterial = new THREE.MeshStandardMaterial({ color: 0x25231f, roughness: 0.34, metalness: 0.52 });
-    const lensMaterial = rememberLightResponsiveMaterial(new THREE.MeshBasicMaterial({ color: 0xffe6bd, toneMapped: false }), 0x2c2115);
-    const railGeometry = new THREE.BoxGeometry(ROOM_WIDTH - 1.2, 0.055, 0.075);
-    const fixtureGeometry = new THREE.CylinderGeometry(0.07, 0.09, 0.14, 12);
-    const lensGeometry = new THREE.CylinderGeometry(0.04, 0.04, 0.006, 12);
-    const railZ = [-0.78, 0.78];
-    const fixtureCount = Math.max(5, Math.ceil(ROOM_WIDTH / 3.5));
-    const fixtureX = Array.from({ length: fixtureCount }, (_, index) => (
-      fixtureCount === 1
-        ? 0
-        : THREE.MathUtils.lerp(-ROOM_WIDTH * 0.38, ROOM_WIDTH * 0.38, index / (fixtureCount - 1))
-    ));
+    const trackMaterial = rememberMaterial(new THREE.MeshStandardMaterial({ color: 0x151412, roughness: 0.34, metalness: 0.72 }));
+    const fixtureMaterial = rememberMaterial(new THREE.MeshStandardMaterial({ color: 0x292622, roughness: 0.3, metalness: 0.58 }));
+    const lensMaterial = rememberLightResponsiveMaterial(
+      new THREE.MeshBasicMaterial({ color: 0xffd8a0, toneMapped: false }),
+      0x2b1b0d,
+      MIN_ARTWORK_LENS_FACTOR
+    );
+    const fixtureGeometry = new THREE.CylinderGeometry(0.072, 0.104, 0.19, 12);
+    const lensGeometry = new THREE.CylinderGeometry(0.055, 0.055, 0.008, 16);
+    const mountGeometry = new THREE.CylinderGeometry(0.022, 0.022, 0.16, 8);
+    const downAxis = new THREE.Vector3(0, -1, 0);
+    const trackGroups = new Map();
 
-    railZ.forEach((z) => {
-      const rail = rememberMesh(railGeometry, trackMaterial);
-      rail.position.set(0, ROOM_HEIGHT - 0.17, z);
-      scene.add(rail);
-
-      fixtureX.forEach((x) => {
-        const fixture = rememberMesh(fixtureGeometry, fixtureMaterial);
-        fixture.position.set(x, ROOM_HEIGHT - 0.28, z);
-        scene.add(fixture);
-
-        const lens = rememberMesh(lensGeometry, lensMaterial);
-        lens.position.set(x, ROOM_HEIGHT - 0.353, z);
-        scene.add(lens);
-      });
+    artworkPlacements.forEach((placement) => {
+      const normal = placement.normal;
+      const key = `${Math.round(normal.x)},${Math.round(normal.z)}`;
+      const group = trackGroups.get(key) || [];
+      group.push(placement);
+      trackGroups.set(key, group);
     });
 
-    artworkPlacements.forEach(({ position, normal }) => {
-      const spotlight = rememberLight(new THREE.SpotLight(0xffe7c7, 7, 7, THREE.MathUtils.degToRad(24), 0.52, 1.3));
-      spotlight.position.copy(position).addScaledVector(normal, 0.78);
-      spotlight.position.y = ROOM_HEIGHT - 0.34;
-      spotlight.target.position.copy(position);
+    trackGroups.forEach((placements) => {
+      const normal = placements[0].normal;
+      const tangent = new THREE.Vector3(-normal.z, 0, normal.x);
+      const mountPoints = placements.map(({ position }) => {
+        const mountPoint = position.clone().addScaledVector(normal, 0.78);
+        mountPoint.y = ROOM_HEIGHT - 0.17;
+        return mountPoint;
+      });
+      const distances = mountPoints.map((point) => point.dot(tangent));
+      const start = Math.min(...distances) - 0.48;
+      const end = Math.max(...distances) + 0.48;
+      const normalOffset = mountPoints[0].dot(normal);
+      const railCenter = tangent.clone().multiplyScalar((start + end) / 2).addScaledVector(normal, normalOffset);
+      railCenter.y = ROOM_HEIGHT - 0.17;
+
+      const rail = rememberMesh(new THREE.BoxGeometry(end - start, 0.055, 0.082), trackMaterial);
+      rail.name = "artwork-track-rail";
+      rail.position.copy(railCenter);
+      rail.quaternion.setFromUnitVectors(new THREE.Vector3(1, 0, 0), tangent);
+      scene.add(rail);
+    });
+
+    artworkPlacements.forEach(({ position, normal, height }) => {
+      const mountPosition = position.clone().addScaledVector(normal, 0.78);
+      mountPosition.y = ROOM_HEIGHT - 0.17;
+      const headPosition = mountPosition.clone();
+      headPosition.y -= 0.12;
+      const artworkTarget = position.clone();
+      artworkTarget.y += Number.isFinite(height) ? Math.min(height * 0.08, 0.16) : 0;
+      const aimDirection = artworkTarget.clone().sub(headPosition).normalize();
+
+      const mount = rememberMesh(mountGeometry, fixtureMaterial);
+      mount.name = "artwork-track-mount";
+      mount.position.copy(mountPosition);
+      mount.position.y -= 0.08;
+      scene.add(mount);
+
+      const fixture = new THREE.Group();
+      fixture.name = "artwork-track-spotlight";
+      fixture.position.copy(headPosition);
+      fixture.quaternion.setFromUnitVectors(downAxis, aimDirection);
+
+      const housing = rememberMesh(fixtureGeometry, fixtureMaterial);
+      const lens = rememberMesh(lensGeometry, lensMaterial);
+      lens.position.y = -0.099;
+      fixture.add(housing, lens);
+      scene.add(fixture);
+
+      const spotlight = rememberLight(
+        new THREE.SpotLight(0xffdfa9, 15, 4.8, THREE.MathUtils.degToRad(22), 0.62, 1.4),
+        MIN_ARTWORK_SPOTLIGHT_FACTOR
+      );
+      spotlight.castShadow = false;
+      spotlight.position.copy(headPosition).addScaledVector(aimDirection, 0.105);
+      spotlight.target.position.copy(artworkTarget);
       scene.add(spotlight, spotlight.target);
     });
   }
@@ -583,19 +625,25 @@ export async function createGalleryScene({
     const frameMaterial = new THREE.MeshStandardMaterial({ color: 0x171716, roughness: 0.42, metalness: 0.16 });
     const frame = rememberMesh(new THREE.BoxGeometry(width + frameWidth * 2, height + frameWidth * 2, frameDepth), frameMaterial);
     frame.position.z = frameDepth / 2 + 0.012;
-    frame.castShadow = true;
-    frame.receiveShadow = true;
+    frame.castShadow = false;
+    frame.receiveShadow = false;
     frame.userData.work = work;
     group.add(frame);
 
-    const imageMaterial = new THREE.MeshBasicMaterial({
+    const imageMaterial = new THREE.MeshStandardMaterial({
       color: 0xffffff,
       map: loadArtworkTexture(work.sceneImageSrc || work.imageSrc || artworkImage),
+      emissive: 0x110c08,
+      emissiveIntensity: 0.06,
+      roughness: 0.82,
+      metalness: 0,
       side: THREE.FrontSide,
-      toneMapped: false
+      toneMapped: true
     });
     const image = rememberMesh(new THREE.PlaneGeometry(width, height), imageMaterial);
     image.position.z = frameDepth + 0.026;
+    image.castShadow = false;
+    image.receiveShadow = false;
     image.userData.work = work;
     group.add(image);
 
@@ -709,18 +757,57 @@ export async function createGalleryScene({
   }
 
   function move(direction) {
-    if (disposed || !movementDescription(direction)) return false;
+    if (disposed || isMoving || !movementDescription(direction)) return false;
     if (!canMove(direction)) {
       emit("blocked", false, blockedMovementDescription(direction));
       return false;
     }
 
     const vector = movementVector(direction);
-    positionX += vector.x * STEP_METRES;
-    positionZ += vector.z * STEP_METRES;
-    syncCamera();
-    render();
-    emit("move", true, `Шаг на 1 метр ${movementDescription(direction)}. ${lookDescription(yaw, pitch)}`);
+    const startX = positionX;
+    const startZ = positionZ;
+    const targetX = startX + vector.x * STEP_METRES;
+    const targetZ = startZ + vector.z * STEP_METRES;
+    const completedMessage = `Шаг на 1 метр ${movementDescription(direction)}. ${lookDescription(yaw, pitch)}`;
+
+    const finishMove = () => {
+      positionX = targetX;
+      positionZ = targetZ;
+      isMoving = false;
+      movementAnimationFrame = null;
+      movementTarget = null;
+      syncCamera();
+      render();
+      emit("move", true, completedMessage);
+    };
+
+    if (prefersReducedMotion()) {
+      finishMove();
+      return true;
+    }
+
+    isMoving = true;
+    movementTarget = { x: targetX, z: targetZ };
+    emit("move-start", false);
+    let startTime = null;
+    const animateMove = (timestamp) => {
+      if (disposed) return;
+      if (startTime === null) startTime = timestamp;
+      const progress = Math.min(1, (timestamp - startTime) / MOVEMENT_DURATION_MS);
+      const easedProgress = easedMovement(progress);
+      positionX = THREE.MathUtils.lerp(startX, targetX, easedProgress);
+      positionZ = THREE.MathUtils.lerp(startZ, targetZ, easedProgress);
+      syncCamera();
+      render();
+
+      if (progress < 1) {
+        movementAnimationFrame = requestAnimationFrame(animateMove);
+        return;
+      }
+
+      finishMove();
+    };
+    movementAnimationFrame = requestAnimationFrame(animateMove);
     return true;
   }
 
@@ -746,6 +833,8 @@ export async function createGalleryScene({
   function dispose() {
     if (disposed) return;
     disposed = true;
+    if (movementAnimationFrame !== null) cancelAnimationFrame(movementAnimationFrame);
+    movementTarget = null;
     resizeObserver?.disconnect();
     window.removeEventListener("resize", resize);
     canvas.removeEventListener("pointerdown", handlePointerDown);
@@ -756,18 +845,16 @@ export async function createGalleryScene({
     geometries.forEach((geometry) => geometry.dispose());
     materials.forEach((material) => material.dispose());
     floorTexture?.dispose();
-    modelTextures.forEach((texture) => texture.dispose());
     artworkTextures.forEach((texture) => texture.dispose());
-    roomModel?.removeFromParent();
     renderer.dispose();
     renderer.forceContextLoss?.();
     canvas.remove();
   }
 
   try {
-    addRoomModel(importedRoomModel);
+    if (signal?.aborted) throw createAbortError();
+    addRoomShell();
     const resolvedArtworkPlacements = galleryWorks.map(resolveArtworkPlacement);
-    addRoomEnvelope();
     addLights(resolvedArtworkPlacements);
     resolvedArtworkPlacements.forEach(addArtwork);
     syncCamera();
