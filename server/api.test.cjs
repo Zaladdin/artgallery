@@ -5,7 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 const sharp = require('sharp');
 const http = require('node:http');
-const { startServer } = require('./index.cjs');
+const { createApp, startServer } = require('./index.cjs');
 
 async function fixture(t) {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gallery-api-test-'));
@@ -26,6 +26,46 @@ async function fixture(t) {
   };
   return { app, base, call, get cookie() { return cookie; } };
 }
+
+test('hosted server requires provisioning and permits only the configured HTTPS origin', async (t) => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gallery-hosted-test-'));
+  const publicOrigin = 'https://gallery.example.test';
+  const password = 'fixture-only-admin-password';
+  await assert.rejects(createApp({ publicOrigin, dataDir, adminPassword: '' }), /GALLERY_ADMIN_PASSWORD/);
+  await assert.rejects(createApp({ publicOrigin: 'http://gallery.example.test', dataDir }), /HTTPS/);
+  const app = await createApp({ publicOrigin, dataDir, seed: [], adminPassword: password, trustRenderProxy: true });
+  const server = http.createServer(app.handler);
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(async () => { await new Promise(resolve => server.close(resolve)); app.close(); await fs.rm(dataDir, { recursive: true, force: true }); });
+  const call = (route, body, headers = {}) => new Promise((resolve, reject) => {
+    const request = http.request({ host: '127.0.0.1', port: server.address().port, path: route,
+      method: body === undefined ? 'GET' : 'POST', headers: { Host: 'gallery.example.test', Origin: publicOrigin, 'Content-Type': 'application/json', ...headers } }, response => {
+      const chunks = [];
+      response.on('data', chunk => chunks.push(chunk));
+      response.on('end', () => resolve({ status: response.statusCode, headers: response.headers, body: JSON.parse(Buffer.concat(chunks)) }));
+    });
+    request.on('error', reject);
+    request.end(body === undefined ? undefined : JSON.stringify(body));
+  });
+  assert.equal((await call('/health')).status, 200);
+  assert.equal((await call('/api/status')).body.setupRequired, false);
+  assert.equal((await call('/api/setup', { password })).status, 404);
+  assert.equal((await call('/api/login', { password }, { Origin: 'http://gallery.example.test', 'X-Forwarded-Proto': 'https' })).status, 403);
+  assert.equal((await call('/api/login', { password }, { Host: 'evil.example.test' })).status, 403);
+  const attacker = { 'CF-Connecting-IP': '192.0.2.2' };
+  for (let attempt = 0; attempt < 10; attempt++) {
+    assert.equal((await call('/api/login', { password: 'short' }, attacker)).status, 400);
+  }
+  assert.equal((await call('/api/login', { password }, attacker)).status, 429);
+  const login = await call('/api/login', { password }, { 'CF-Connecting-IP': '192.0.2.3' });
+  assert.equal(login.status, 200);
+  const cookie = login.headers['set-cookie'][0];
+  assert.match(cookie, /^__Host-gallery_session=\w+; HttpOnly; SameSite=Strict; Path=\/; Secure;/);
+  assert.equal((await call('/api/admin/artists', undefined, { Cookie: cookie.split(';')[0] })).status, 200);
+  const logout = await call('/api/logout', {}, { Cookie: cookie.split(';')[0], 'X-CSRF-Token': login.body.csrfToken });
+  assert.equal(logout.status, 200);
+  assert.match(logout.headers['set-cookie'][0], /Secure; Max-Age=0/);
+});
 
 test('setup, sessions, CSRF, password verification, and origin restrictions', async (t) => {
   const { call, base } = await fixture(t);

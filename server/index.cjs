@@ -3,6 +3,7 @@ const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { isIP } = require('node:net');
 const { promisify } = require('node:util');
 const { DatabaseSync } = require('node:sqlite');
 const { Worker } = require('node:worker_threads');
@@ -98,8 +99,15 @@ function processImage(inputPath, outputDir, format) {
 }
 
 async function createApp(options = {}) {
+  const configuredOrigin = options.publicOrigin ?? (process.env.GALLERY_PUBLIC_ORIGIN || process.env.RENDER_EXTERNAL_URL);
+  const publicUrl = configuredOrigin ? new URL(configuredOrigin) : null;
+  if (publicUrl && (publicUrl.protocol !== 'https:' || publicUrl.href !== `${publicUrl.origin}/`)) {
+    throw new Error('GALLERY_PUBLIC_ORIGIN must be an HTTPS origin without a path.');
+  }
+  const storage = options.dataDir || process.env.GALLERY_DATA_DIR;
+  if (publicUrl && !storage) throw new Error('Set GALLERY_DATA_DIR to a persistent disk mount.');
   const staticDir = path.resolve(options.staticDir || path.join(__dirname, '..', 'prototype'));
-  const dataDir = path.resolve(options.dataDir || process.env.GALLERY_DATA_DIR || path.join(__dirname, '..', '.gallery-data'));
+  const dataDir = path.resolve(storage || path.join(__dirname, '..', '.gallery-data'));
   if (dataDir === staticDir || dataDir.startsWith(staticDir + path.sep)) throw new Error('Private data directory cannot be inside static root.');
   await fsp.mkdir(path.join(dataDir, 'media'), { recursive: true });
   const db = new DatabaseSync(path.join(dataDir, 'gallery.sqlite'));
@@ -112,12 +120,28 @@ async function createApp(options = {}) {
     CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, csrf TEXT NOT NULL, expires INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS limits (key TEXT PRIMARY KEY, count INTEGER NOT NULL, expires INTEGER NOT NULL);`);
   const getConfig = (key) => db.prepare('SELECT value FROM config WHERE key = ?').get(key)?.value;
+  async function passwordRecord(password) {
+    const salt = crypto.randomBytes(16).toString('hex');
+    const hash = (await scrypt(password, salt, 64)).toString('hex');
+    return JSON.stringify({ salt, hash });
+  }
+  if (publicUrl && !getConfig('admin')) {
+    const password = options.adminPassword ?? process.env.GALLERY_ADMIN_PASSWORD;
+    if (typeof password !== 'string' || password.length < 16 || password.length > 128) {
+      db.close();
+      throw new Error('Set GALLERY_ADMIN_PASSWORD to a unique password of 16–128 characters before first deployment.');
+    }
+    db.prepare('INSERT OR IGNORE INTO config VALUES (?, ?)').run('admin', await passwordRecord(password));
+  }
+  const sessionName = publicUrl ? '__Host-gallery_session' : 'gallery_session';
+  const sessionAttributes = `HttpOnly; SameSite=Strict; Path=/${publicUrl ? '; Secure' : ''}`;
+  const trustRenderProxy = Boolean(publicUrl && (options.trustRenderProxy ?? process.env.RENDER === 'true'));
   const transaction = (fn) => { db.exec('BEGIN IMMEDIATE'); try { const value = fn(); db.exec('COMMIT'); return value; } catch (error) { db.exec('ROLLBACK'); throw error; } };
   const json = (response, status, value) => { response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }); response.end(JSON.stringify(value)); };
   const hashToken = (token) => crypto.createHash('sha256').update(token).digest('hex');
   const sessionFor = (request) => {
-    const cookie = request.headers.cookie?.split(';').map((item) => item.trim()).find((item) => item.startsWith('gallery_session='));
-    const token = cookie?.slice('gallery_session='.length);
+    const cookie = request.headers.cookie?.split(';').map((item) => item.trim()).find((item) => item.startsWith(`${sessionName}=`));
+    const token = cookie?.slice(sessionName.length + 1);
     if (!token || !/^[a-f0-9]{64}$/.test(token)) return null;
     return db.prepare('SELECT token_hash, csrf, expires FROM sessions WHERE token_hash = ? AND expires > ?').get(hashToken(token), Date.now()) || null;
   };
@@ -126,12 +150,17 @@ async function createApp(options = {}) {
     const csrf = crypto.randomBytes(32).toString('hex');
     db.prepare('DELETE FROM sessions WHERE expires <= ?').run(Date.now());
     db.prepare('INSERT INTO sessions VALUES (?, ?, ?)').run(hashToken(token), csrf, Date.now() + SESSION_MS);
-    response.setHeader('Set-Cookie', `gallery_session=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_MS / 1000}`);
+    response.setHeader('Set-Cookie', `${sessionName}=${token}; ${sessionAttributes}; Max-Age=${SESSION_MS / 1000}`);
     return csrf;
   }
   const statusFor = (session) => ({ backend: true, setupRequired: !getConfig('admin'), authenticated: Boolean(session), ...(session ? { csrfToken: session.csrf } : {}) });
+  let nextLimitCleanup = 0;
   function rateLimit(key, count, windowMs) {
     const now = Date.now();
+    if (now >= nextLimitCleanup) {
+      db.prepare('DELETE FROM limits WHERE expires <= ?').run(now);
+      nextLimitCleanup = now + 60_000;
+    }
     const row = db.prepare('SELECT count, expires FROM limits WHERE key = ?').get(key);
     if (!row || row.expires <= now) db.prepare('INSERT INTO limits VALUES (?, 1, ?) ON CONFLICT(key) DO UPDATE SET count=1, expires=excluded.expires').run(key, now + windowMs);
     else {
@@ -191,27 +220,38 @@ async function createApp(options = {}) {
     try {
       const host = request.headers.host;
       const port = request.socket.localPort;
-      if (![ `127.0.0.1:${port}`, `localhost:${port}` ].includes(host)) throw new ApiError(403, 'Недопустимый адрес сервера.');
-      const url = new URL(request.url, `http://${host}`);
+      const allowedHosts = publicUrl ? [publicUrl.host] : [`127.0.0.1:${port}`, `localhost:${port}`];
+      if (!allowedHosts.includes(host)) throw new ApiError(403, 'Недопустимый адрес сервера.');
+      const origin = publicUrl?.origin || `http://${host}`;
+      const url = new URL(request.url, origin);
       const pathname = decodeURIComponent(url.pathname);
+      if (publicUrl) response.setHeader('Strict-Transport-Security', 'max-age=31536000');
+      if (pathname === '/health' && request.method === 'GET') {
+        db.prepare('SELECT 1').get();
+        return json(response, 200, { status: 'ok' });
+      }
       const session = sessionFor(request);
       if (!['GET', 'HEAD'].includes(request.method)) {
-        if (request.headers.origin !== `http://${host}` || ['cross-site', 'same-site'].includes(request.headers['sec-fetch-site'])) throw new ApiError(403, 'Запрос должен выполняться со страницы галереи.');
+        if (request.headers.origin !== origin || ['cross-site', 'same-site'].includes(request.headers['sec-fetch-site'])) throw new ApiError(403, 'Запрос должен выполняться со страницы галереи.');
       }
       if (pathname.startsWith('/api/')) {
-        rateLimit(`api:${request.socket.remoteAddress}`, 600, 60_000);
+        if (!publicUrl) rateLimit(`api:${request.socket.remoteAddress}`, 600, 60_000);
+        else if (session) rateLimit(`api-session:${session.token_hash}`, 600, 60_000);
         if (pathname === '/api/status' && request.method === 'GET') return json(response, 200, statusFor(session));
         if (pathname === '/api/artists' && request.method === 'GET') return json(response, 200, db.prepare('SELECT published FROM artists WHERE published IS NOT NULL ORDER BY slug').all().map((row) => JSON.parse(row.published)));
         if (['/api/setup', '/api/login'].includes(pathname) && request.method === 'POST') {
-          rateLimit(`login:${request.socket.remoteAddress}`, 10, 15 * 60_000);
+          if (publicUrl && pathname === '/api/setup') throw new ApiError(404, 'Первичная настройка через сайт отключена.');
+          const proxyIp = request.headers['cf-connecting-ip'];
+          // Render's public edge sets this header; never accept it on an unmanaged host.
+          const loginIp = trustRenderProxy && typeof proxyIp === 'string' && isIP(proxyIp) ? proxyIp : request.socket.remoteAddress;
+          rateLimit(`login:${loginIp}`, 10, 15 * 60_000);
           const { password } = await readJson(request);
           if (typeof password !== 'string' || password.length < 12 || password.length > 128) throw new ApiError(400, 'Пароль должен содержать от 12 до 128 символов.');
           const admin = getConfig('admin');
           if (pathname === '/api/setup') {
             if (admin) throw new ApiError(409, 'Администратор уже создан. Войдите с паролем.');
-            const salt = crypto.randomBytes(16).toString('hex');
-            const hash = (await scrypt(password, salt, 64)).toString('hex');
-            try { db.prepare('INSERT INTO config VALUES(?,?)').run('admin', JSON.stringify({ salt, hash })); } catch { throw new ApiError(409, 'Администратор уже создан.'); }
+            const record = await passwordRecord(password);
+            try { db.prepare('INSERT INTO config VALUES(?,?)').run('admin', record); } catch { throw new ApiError(409, 'Администратор уже создан.'); }
           } else {
             if (!admin) throw new ApiError(409, 'Сначала создайте пароль администратора.');
             const stored = JSON.parse(admin);
@@ -225,7 +265,7 @@ async function createApp(options = {}) {
         if (request.method !== 'GET' && request.headers['x-csrf-token'] !== session.csrf) throw new ApiError(403, 'Сессия устарела. Обновите страницу и повторите.');
         if (pathname === '/api/logout' && request.method === 'POST') {
           db.prepare('DELETE FROM sessions WHERE token_hash=?').run(session.token_hash);
-          response.setHeader('Set-Cookie', 'gallery_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');
+          response.setHeader('Set-Cookie', `${sessionName}=; ${sessionAttributes}; Max-Age=0`);
           return json(response, 200, { authenticated: false });
         }
         if (pathname === '/api/admin/artists' && request.method === 'GET') return json(response, 200, db.prepare('SELECT * FROM artists ORDER BY slug').all().map(draftFor));
@@ -328,7 +368,7 @@ async function createApp(options = {}) {
       else response.end();
     }
   }
-  return { handler, db, dataDir, close: () => db.close() };
+  return { handler, db, dataDir, publicOrigin: publicUrl?.origin, close: () => db.close() };
 }
 
 async function startServer(options = {}) {
@@ -336,7 +376,7 @@ async function startServer(options = {}) {
   const server = http.createServer(app.handler);
   server.requestTimeout = 90_000;
   server.headersTimeout = 15_000;
-  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(options.port ?? Number(process.env.PORT || 4173), '127.0.0.1', resolve); });
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(options.port ?? Number(process.env.PORT || 4173), app.publicOrigin ? '0.0.0.0' : '127.0.0.1', resolve); });
   return { ...app, server, close: async () => { await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve())); app.close(); } };
 }
 

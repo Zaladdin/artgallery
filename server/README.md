@@ -7,7 +7,17 @@ npm ci
 npm start
 ```
 
-Open `http://127.0.0.1:4173/#/admin`. The first administrator chooses a password of 12–128 characters. No default password is shipped. The server listens only on loopback; do not expose it directly to a public network. Hosted deployment needs an HTTPS reverse proxy, Secure session cookies, a backup policy and hosting-specific configuration. GitHub Pages continues to host the static public gallery but cannot run this authoring API.
+Open `http://127.0.0.1:4173/#/admin`. The first administrator chooses a password of 12–128 characters. No default password is shipped. Local mode listens only on loopback. GitHub Pages serves the static public gallery but cannot run this authoring API.
+
+## Online admin and gallery
+
+The repository's `render.yaml` provisions one Node web service and a persistent disk for SQLite and uploaded images. Import the repository under **New → Blueprint** in the Render dashboard. Review the paid service and disk before applying. The Standard plan leaves memory for large image conversions. Supply `GALLERY_ADMIN_PASSWORD` directly in the hosting dashboard as a unique 16–128 character password. Never commit it or pass it in a URL. Once the service is healthy, open its HTTPS URL followed by `/#/admin`. Use the same service's public gallery URL for visitors: publishing from the editor updates that site directly. The separate GitHub Pages site stays a static copy.
+
+Hosted mode takes its canonical HTTPS origin from `GALLERY_PUBLIC_ORIGIN` or Render's `RENDER_EXTERNAL_URL`. It uses `PORT`, binds to the provider's network, and must sit behind the provider's HTTPS proxy; do not expose its raw Node port on an unmanaged host. Configure a single canonical domain for both user requests and health checks. Set `GALLERY_DATA_DIR` to an attached persistent volume outside the frontend directory. The provided blueprint uses `/var/data` and `/health`. Do not scale this SQLite service to multiple instances.
+
+On the first boot against a new disk, the server requires the provisioning password and stores its scrypt hash. Existing stored passwords are not overwritten by the environment variable. Browser-based initial setup is disabled in hosted mode. Sessions are host-bound Secure, HttpOnly, SameSite=Strict cookies. On Render, sign-in limits use the validated `CF-Connecting-IP` supplied by its public edge; other deployments use the socket address. Keep this service isolated from untrusted private-network clients. Signed-in API calls have a per-session limit. The gallery remains readable even if login is temporarily limited.
+
+On an empty disk the existing bundled exhibition is seeded. Local database changes and uploaded files do not migrate automatically. To migrate an existing gallery, make a consistent copy of the stopped local server's data directory and restore it on the persistent volume before starting the new instance. Keep private backups off GitHub. After deployment verify `/health`, login, a draft upload and preview, and that public viewing reflects publication.
 
 Configuration:
 
