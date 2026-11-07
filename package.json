@@ -1,0 +1,18 @@
+{
+  "name": "smotritel-gallery",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Local gallery authoring server and static public gallery",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "start": "node server/index.cjs",
+    "test": "node --test server/*.test.cjs",
+    "export:static": "node server/export-static.cjs"
+  },
+  "dependencies": {
+    "heic-decode": "^2.1.0",
+    "sharp": "^0.35.5"
+  }
+}

@@ -9,6 +9,11 @@ const FRAME_WIDTH_METRES = 0.07;
 const MIN_ARTWORK_SPOTLIGHT_FACTOR = 1;
 const MIN_ARTWORK_LENS_FACTOR = 1;
 const MOVEMENT_DURATION_MS = 280;
+const VIEWPOINT_DISTANCE_METRES = 1.35;
+const VIEWPOINT_MARKER_HEIGHT_METRES = 0.024;
+const VIEWPOINT_MIN_DURATION_MS = 420;
+const VIEWPOINT_MAX_DURATION_MS = 1250;
+const VIEWPOINT_DURATION_PER_METRE_MS = 95;
 
 const DEGREE = 180 / Math.PI;
 
@@ -109,7 +114,8 @@ export async function createGalleryScene({
 
   const camera = new THREE.PerspectiveCamera(63, 1, 0.05, CAMERA_FAR);
   const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  const coarsePointer = Boolean(window.matchMedia?.('(pointer: coarse)').matches);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, coarsePointer ? 1.25 : 2));
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   const fullLightExposure = 1.04;
@@ -129,6 +135,8 @@ export async function createGalleryScene({
   const geometries = new Set();
   const materials = new Set();
   const artHitTargets = [];
+  const viewpointHitTargets = [];
+  const artworkViewpoints = new Map();
   const roomCollisionTargets = [];
   const controllableLights = [];
   const lightResponsiveMaterials = [];
@@ -260,6 +268,10 @@ export async function createGalleryScene({
       : 1 - ((-2 * progress + 2) ** 3) / 2;
   }
 
+  function shortestAngleDelta(from, to) {
+    return THREE.MathUtils.euclideanModulo(to - from + Math.PI, Math.PI * 2) - Math.PI;
+  }
+
   function forwardVector() {
     return {
       x: -Math.sin(yaw),
@@ -346,6 +358,8 @@ export async function createGalleryScene({
       isMoving,
       targetX: movementTarget?.x,
       targetZ: movementTarget?.z,
+      movementDurationMs: movementTarget?.durationMs,
+      targetHeadingDegrees: movementTarget?.headingDegrees,
       direction: directionForYaw(yaw)
     };
 
@@ -372,10 +386,10 @@ export async function createGalleryScene({
 
     const boardCount = 40;
     const boardWidth = textureCanvas.width / boardCount;
-    const boardShades = ["#d8ab70", "#c8965c", "#e1bc82", "#b9854e", "#d1a269", "#e7c28c"];
-    const seamColor = "rgba(84, 52, 28, .2)";
+    const boardShades = ["#d9c4a2", "#d6bf9a", "#dfccad", "#d4bd98", "#dac6a5", "#dfcbaa"];
+    const seamColor = "rgba(84, 52, 28, .09)";
 
-    context.fillStyle = "#c9935a";
+    context.fillStyle = "#d6c09e";
     context.fillRect(0, 0, textureCanvas.width, textureCanvas.height);
 
     for (let board = 0; board < boardCount; board += 1) {
@@ -389,10 +403,10 @@ export async function createGalleryScene({
         const height = segmentHeights[(board + segment * 3) % segmentHeights.length];
         const shade = boardShades[(board * 5 + segment * 2) % boardShades.length];
         const gradient = context.createLinearGradient(x, y, x + boardWidth, y + height);
-        gradient.addColorStop(0, "#f0cf9d");
+        gradient.addColorStop(0, "#e2d0b4");
         gradient.addColorStop(0.22, shade);
         gradient.addColorStop(0.78, shade);
-        gradient.addColorStop(1, "#a87445");
+        gradient.addColorStop(1, "#cfb994");
         context.fillStyle = gradient;
         context.fillRect(x + 1, y + 1, boardWidth - 2, height - 2);
 
@@ -407,7 +421,7 @@ export async function createGalleryScene({
         segment += 1;
       }
 
-      context.strokeStyle = "rgba(84, 52, 28, .28)";
+      context.strokeStyle = "rgba(84, 52, 28, .09)";
       context.lineWidth = 1.4;
       context.beginPath();
       context.moveTo(x, 0);
@@ -416,7 +430,7 @@ export async function createGalleryScene({
 
       for (let grain = 0; grain < 4; grain += 1) {
         const grainX = x + boardWidth * ((grain + 1) / 5);
-        context.strokeStyle = "rgba(103, 65, 39, .14)";
+        context.strokeStyle = "rgba(103, 65, 39, .07)";
         context.lineWidth = 1;
         context.beginPath();
         context.moveTo(grainX, 0);
@@ -432,14 +446,14 @@ export async function createGalleryScene({
     texture.repeat.set(1, 1);
     texture.center.set(0.5, 0.5);
     texture.rotation = Math.PI / 2;
-    texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+    texture.anisotropy = Math.min(4, renderer.capabilities.getMaxAnisotropy());
     return texture;
   }
 
   function addRoomShell() {
     const wallThickness = 0.12;
     const wallMaterial = rememberLightResponsiveMaterial(new THREE.MeshStandardMaterial({
-      color: 0xf1eee7,
+      color: /^#[0-9a-f]{6}$/i.test(roomConfig.wallColor || '') ? roomConfig.wallColor : 0xf1eee7,
       roughness: 0.84,
       metalness: 0
     }), 0x716b63);
@@ -622,7 +636,7 @@ export async function createGalleryScene({
     group.position.copy(position);
     group.quaternion.setFromUnitVectors(DEFAULT_NORMAL, normal);
 
-    const frameMaterial = new THREE.MeshStandardMaterial({ color: 0x171716, roughness: 0.42, metalness: 0.16 });
+    const frameMaterial = new THREE.MeshStandardMaterial({ color: /^#[0-9a-f]{6}$/i.test(roomConfig.frameColor || '') ? roomConfig.frameColor : 0x171716, roughness: 0.42, metalness: 0.16 });
     const frame = rememberMesh(new THREE.BoxGeometry(width + frameWidth * 2, height + frameWidth * 2, frameDepth), frameMaterial);
     frame.position.z = frameDepth / 2 + 0.012;
     frame.castShadow = false;
@@ -651,6 +665,61 @@ export async function createGalleryScene({
     scene.add(group);
   }
 
+  function addArtworkViewpoint({ work, position, normal, height }) {
+    const viewpointPosition = position.clone().addScaledVector(normal, VIEWPOINT_DISTANCE_METRES);
+    viewpointPosition.y = VIEWPOINT_MARKER_HEIGHT_METRES;
+    if (!isClear(viewpointPosition.x, viewpointPosition.z)) {
+      throw new RangeError(`Viewpoint for ${work.id} is outside the walkable room.`);
+    }
+
+    const artworkTarget = position.clone();
+    artworkTarget.y += Number.isFinite(height) ? Math.min(height * 0.08, 0.16) : 0;
+    const markerMaterial = rememberMaterial(new THREE.MeshBasicMaterial({
+      color: 0xf4b497,
+      transparent: true,
+      opacity: 0.92,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+      toneMapped: false
+    }));
+    const hitTargetMaterial = rememberMaterial(new THREE.MeshBasicMaterial({
+      transparent: true,
+      opacity: 0,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+      toneMapped: false
+    }));
+    const markerRing = rememberMesh(new THREE.RingGeometry(0.17, 0.23, 40), markerMaterial);
+    markerRing.name = "artwork-viewpoint-marker";
+    markerRing.rotation.x = -Math.PI / 2;
+    markerRing.position.copy(viewpointPosition);
+    markerRing.castShadow = false;
+    markerRing.receiveShadow = false;
+
+    const markerCore = rememberMesh(new THREE.CircleGeometry(0.035, 24), markerMaterial);
+    markerCore.name = "artwork-viewpoint-marker-core";
+    markerCore.rotation.x = -Math.PI / 2;
+    markerCore.position.copy(viewpointPosition);
+    markerCore.position.y += 0.002;
+    markerCore.castShadow = false;
+    markerCore.receiveShadow = false;
+
+    const hitTarget = rememberMesh(new THREE.CircleGeometry(0.42, 32), hitTargetMaterial);
+    hitTarget.name = "artwork-viewpoint-hit-target";
+    hitTarget.rotation.x = -Math.PI / 2;
+    hitTarget.position.copy(viewpointPosition);
+    hitTarget.position.y += 0.001;
+    hitTarget.userData.viewpointId = work.id;
+    viewpointHitTargets.push(hitTarget);
+    artworkViewpoints.set(work.id, {
+      work,
+      position: viewpointPosition,
+      artworkTarget,
+      wallLabel: normal.z > 0 ? "левой стене" : "правой стене"
+    });
+    scene.add(markerRing, markerCore, hitTarget);
+  }
+
   function loadArtworkTexture(sourcePath) {
     if (!sourcePath) return null;
     const source = new URL(sourcePath, window.location.href).href;
@@ -658,7 +727,7 @@ export async function createGalleryScene({
       source,
       (texture) => {
         texture.colorSpace = THREE.SRGBColorSpace;
-        texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+        texture.anisotropy = Math.min(4, renderer.capabilities.getMaxAnisotropy());
         render();
       },
       undefined,
@@ -669,21 +738,28 @@ export async function createGalleryScene({
     return texture;
   }
 
-  function raycastArtwork(clientX, clientY) {
-    if (!artHitTargets.length) return;
+  function raycastSceneInteraction(clientX, clientY) {
+    if (!artHitTargets.length && !viewpointHitTargets.length) return;
     const bounds = canvas.getBoundingClientRect();
     if (!bounds.width || !bounds.height) return;
 
     pointer.x = ((clientX - bounds.left) / bounds.width) * 2 - 1;
     pointer.y = -((clientY - bounds.top) / bounds.height) * 2 + 1;
     raycaster.setFromCamera(pointer, camera);
-    const hit = raycaster.intersectObjects([...roomCollisionTargets, ...artHitTargets], false)[0];
+    const viewpointHit = raycaster.intersectObjects(viewpointHitTargets, false)[0];
+    const viewpointId = viewpointHit?.object?.userData?.viewpointId;
+    if (viewpointId) {
+      moveToArtwork(viewpointId);
+      return;
+    }
+
+    const hit = raycaster.intersectObjects(artHitTargets, false)[0];
     const work = hit?.object?.userData?.work;
     if (work) onArtworkClick?.(work);
   }
 
   function handlePointerDown(event) {
-    if (disposed || event.button !== 0 || activePointer) return;
+    if (disposed || isMoving || event.button !== 0 || activePointer) return;
     activePointer = {
       id: event.pointerId,
       x: event.clientX,
@@ -731,7 +807,7 @@ export async function createGalleryScene({
       return;
     }
 
-    if (!cancelled) raycastArtwork(event.clientX, event.clientY);
+    if (!cancelled) raycastSceneInteraction(event.clientX, event.clientY);
   }
 
   function handlePointerUp(event) {
@@ -756,6 +832,84 @@ export async function createGalleryScene({
     render();
   }
 
+  function startCameraTransition({
+    targetX,
+    targetZ,
+    targetYaw = yaw,
+    targetPitch = pitch,
+    durationMs = MOVEMENT_DURATION_MS,
+    startType,
+    completedType,
+    completedMessage
+  }) {
+    if (
+      disposed
+      || isMoving
+      || !Number.isFinite(targetX)
+      || !Number.isFinite(targetZ)
+      || !Number.isFinite(targetYaw)
+      || !Number.isFinite(targetPitch)
+      || !isClear(targetX, targetZ)
+    ) return false;
+
+    const startX = positionX;
+    const startZ = positionZ;
+    const startYaw = yaw;
+    const startPitch = pitch;
+    const safeTargetPitch = THREE.MathUtils.clamp(targetPitch, -MAX_PITCH_RADIANS, MAX_PITCH_RADIANS);
+    const safeDuration = Math.max(0, Number.isFinite(durationMs) ? durationMs : MOVEMENT_DURATION_MS);
+    const yawDelta = shortestAngleDelta(startYaw, targetYaw);
+
+    const finishTransition = () => {
+      positionX = targetX;
+      positionZ = targetZ;
+      yaw = targetYaw;
+      pitch = safeTargetPitch;
+      isMoving = false;
+      movementAnimationFrame = null;
+      movementTarget = null;
+      syncCamera();
+      render();
+      emit(completedType, true, completedMessage);
+    };
+
+    if (prefersReducedMotion() || safeDuration === 0) {
+      finishTransition();
+      return true;
+    }
+
+    isMoving = true;
+    movementTarget = {
+      x: targetX,
+      z: targetZ,
+      durationMs: safeDuration,
+      headingDegrees: Math.round(headingForYaw(targetYaw)) % 360
+    };
+    emit(startType, false);
+    let startTime = null;
+    const animateTransition = (timestamp) => {
+      if (disposed) return;
+      if (startTime === null) startTime = timestamp;
+      const progress = Math.min(1, (timestamp - startTime) / safeDuration);
+      const easedProgress = easedMovement(progress);
+      positionX = THREE.MathUtils.lerp(startX, targetX, easedProgress);
+      positionZ = THREE.MathUtils.lerp(startZ, targetZ, easedProgress);
+      yaw = startYaw + yawDelta * easedProgress;
+      pitch = THREE.MathUtils.lerp(startPitch, safeTargetPitch, easedProgress);
+      syncCamera();
+      render();
+
+      if (progress < 1) {
+        movementAnimationFrame = requestAnimationFrame(animateTransition);
+        return;
+      }
+
+      finishTransition();
+    };
+    movementAnimationFrame = requestAnimationFrame(animateTransition);
+    return true;
+  }
+
   function move(direction) {
     if (disposed || isMoving || !movementDescription(direction)) return false;
     if (!canMove(direction)) {
@@ -764,55 +918,49 @@ export async function createGalleryScene({
     }
 
     const vector = movementVector(direction);
-    const startX = positionX;
-    const startZ = positionZ;
-    const targetX = startX + vector.x * STEP_METRES;
-    const targetZ = startZ + vector.z * STEP_METRES;
-    const completedMessage = `Шаг на 1 метр ${movementDescription(direction)}. ${lookDescription(yaw, pitch)}`;
+    const targetX = positionX + vector.x * STEP_METRES;
+    const targetZ = positionZ + vector.z * STEP_METRES;
+    return startCameraTransition({
+      targetX,
+      targetZ,
+      durationMs: MOVEMENT_DURATION_MS,
+      startType: "move-start",
+      completedType: "move",
+      completedMessage: `Шаг на 1 метр ${movementDescription(direction)}. ${lookDescription(yaw, pitch)}`
+    });
+  }
 
-    const finishMove = () => {
-      positionX = targetX;
-      positionZ = targetZ;
-      isMoving = false;
-      movementAnimationFrame = null;
-      movementTarget = null;
-      syncCamera();
-      render();
-      emit("move", true, completedMessage);
-    };
+  function moveToArtwork(workId) {
+    if (disposed || isMoving) return false;
+    const viewpoint = artworkViewpoints.get(workId);
+    if (!viewpoint) return false;
 
-    if (prefersReducedMotion()) {
-      finishMove();
-      return true;
-    }
+    const targetX = viewpoint.position.x;
+    const targetZ = viewpoint.position.z;
+    const horizontalDistance = Math.hypot(viewpoint.artworkTarget.x - targetX, viewpoint.artworkTarget.z - targetZ);
+    const targetYaw = Math.atan2(targetX - viewpoint.artworkTarget.x, targetZ - viewpoint.artworkTarget.z);
+    const targetPitch = Math.atan2(viewpoint.artworkTarget.y - EYE_HEIGHT, horizontalDistance);
+    const travelDistance = Math.hypot(targetX - positionX, targetZ - positionZ);
+    const durationMs = THREE.MathUtils.clamp(
+      Math.round(travelDistance * VIEWPOINT_DURATION_PER_METRE_MS),
+      VIEWPOINT_MIN_DURATION_MS,
+      VIEWPOINT_MAX_DURATION_MS
+    );
 
-    isMoving = true;
-    movementTarget = { x: targetX, z: targetZ };
-    emit("move-start", false);
-    let startTime = null;
-    const animateMove = (timestamp) => {
-      if (disposed) return;
-      if (startTime === null) startTime = timestamp;
-      const progress = Math.min(1, (timestamp - startTime) / MOVEMENT_DURATION_MS);
-      const easedProgress = easedMovement(progress);
-      positionX = THREE.MathUtils.lerp(startX, targetX, easedProgress);
-      positionZ = THREE.MathUtils.lerp(startZ, targetZ, easedProgress);
-      syncCamera();
-      render();
-
-      if (progress < 1) {
-        movementAnimationFrame = requestAnimationFrame(animateMove);
-        return;
-      }
-
-      finishMove();
-    };
-    movementAnimationFrame = requestAnimationFrame(animateMove);
-    return true;
+    return startCameraTransition({
+      targetX,
+      targetZ,
+      targetYaw,
+      targetPitch,
+      durationMs,
+      startType: "viewpoint-start",
+      completedType: "viewpoint",
+      completedMessage: `Вы у работы «${viewpoint.work.title}» на ${viewpoint.wallLabel}. ${lookDescription(targetYaw, targetPitch)}`
+    });
   }
 
   function turn(direction) {
-    if (disposed || (direction !== "left" && direction !== "right")) return false;
+    if (disposed || isMoving || (direction !== "left" && direction !== "right")) return false;
     yaw += direction === "left" ? TURN_RADIANS : -TURN_RADIANS;
     syncCamera();
     render();
@@ -821,7 +969,7 @@ export async function createGalleryScene({
   }
 
   function tilt(direction) {
-    if (disposed || (direction !== "up" && direction !== "down")) return false;
+    if (disposed || isMoving || (direction !== "up" && direction !== "down")) return false;
     const sign = direction === "up" ? 1 : -1;
     pitch = THREE.MathUtils.clamp(pitch + sign * TURN_RADIANS, -MAX_PITCH_RADIANS, MAX_PITCH_RADIANS);
     syncCamera();
@@ -857,6 +1005,7 @@ export async function createGalleryScene({
     const resolvedArtworkPlacements = galleryWorks.map(resolveArtworkPlacement);
     addLights(resolvedArtworkPlacements);
     resolvedArtworkPlacements.forEach(addArtwork);
+    resolvedArtworkPlacements.forEach(addArtworkViewpoint);
     syncCamera();
 
     resizeObserver = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(resize);
@@ -870,7 +1019,7 @@ export async function createGalleryScene({
     resize();
     emit("ready", false, `Точка обзора у входа. ${lookDescription(yaw, pitch)}`);
 
-    return { move, turn, tilt, setLightLevel, dispose, getState };
+    return { move, moveToArtwork, turn, tilt, setLightLevel, dispose, getState };
   } catch (error) {
     dispose();
     throw error;

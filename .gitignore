@@ -4,6 +4,8 @@ dist/
 build/
 coverage/
 *.log
+.gallery-data/
+.gallery-export-*/
 
 # Local configuration and credentials
 .env
