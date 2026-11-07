@@ -1,3 +1,5 @@
+import { isCloudMediaUrl, usesCloudGallery } from './supabase-config.js';
+
 const ACCEPTED_UPLOADS = /\.(jpe?g|png|heic|heif)$/i;
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 
@@ -52,6 +54,7 @@ function unwrapArtist(payload) {
 }
 
 function safeImagePath(value) {
+  if (isCloudMediaUrl(value)) return value;
   if (typeof value !== 'string') return '';
   try {
     const url = new URL(value, location.href);
@@ -62,6 +65,7 @@ function safeImagePath(value) {
 }
 
 export async function renderAdmin(app) {
+  const cloud = usesCloudGallery();
   let active = true;
   let busy = false;
   let dirty = false;
@@ -116,6 +120,10 @@ export async function renderAdmin(app) {
   cleanup.canLeave = canLeave;
 
   async function api(path, { method = 'GET', body: requestBody, headers = {} } = {}) {
+    if (cloud) {
+      const { cloudApi } = await import('./supabase-gallery.js');
+      return cloudApi(path, { method, body: requestBody, signal: controller.signal });
+    }
     const requestHeaders = { ...headers };
     if (method !== 'GET' && csrfToken) requestHeaders['X-CSRF-Token'] = csrfToken;
     let data = requestBody;
@@ -152,6 +160,10 @@ export async function renderAdmin(app) {
       await action();
     } catch (error) {
       if (!active || error.name === 'AbortError') return;
+      if (shell.querySelector('.admin-login') && (error.status === 401 || error.status === 403)) {
+        message(error.message, true);
+        return;
+      }
       if (error.status === 401) {
         csrfToken = '';
         message('Сессия завершилась. Войдите снова. Несохранённая форма останется открытой.', true);
@@ -191,6 +203,7 @@ export async function renderAdmin(app) {
     if (shell.querySelector('.admin-reauth')) return;
     const panel = element('form', 'admin-reauth');
     panel.append(element('p', '', 'Повторный вход'));
+    const email = addCloudEmail(panel);
     const password = field('Пароль администратора', '', () => {}, { type: 'password', required: true });
     password.querySelector('input').autocomplete = 'current-password';
     const submit = element('button', 'admin-button is-primary', 'Войти и продолжить');
@@ -199,7 +212,7 @@ export async function renderAdmin(app) {
     panel.addEventListener('submit', (event) => {
       event.preventDefault();
       run(async () => {
-        await api('login', { method: 'POST', body: { password: password.querySelector('input').value } });
+        await api('login', { method: 'POST', body: { email: email?.value.trim(), password: password.querySelector('input').value } });
         if (refreshAfterLogin) {
           refreshAfterLogin = false;
           await loadArtists(draft?.slug);
@@ -209,7 +222,16 @@ export async function renderAdmin(app) {
       });
     });
     body.prepend(panel);
-    password.querySelector('input').focus();
+    (email || password.querySelector('input')).focus();
+  }
+
+  function addCloudEmail(panel) {
+    if (!cloud) return null;
+    const email = field('Email администратора', '', () => {}, { type: 'email', required: true, maxLength: 254 });
+    const input = email.querySelector('input');
+    input.autocomplete = 'username';
+    panel.append(email);
+    return input;
   }
 
   function renderLogin(setupRequired) {
@@ -219,6 +241,7 @@ export async function renderAdmin(app) {
     panel.append(element('p', 'admin-eyebrow', setupRequired ? 'Первый вход' : 'Закрытая мастерская'));
     panel.append(element('h2', '', setupRequired ? 'Создайте пароль администратора' : 'Войдите в мастерскую'));
     panel.append(element('p', 'admin-hint', setupRequired ? 'Пароль защищает создание и публикацию выставок. Используйте не менее 12 символов.' : 'Здесь можно загрузить работы, изменить экспозицию и опубликовать её.'));
+    const email = addCloudEmail(panel);
     const password = field('Пароль', '', () => {}, { type: 'password', required: true, maxLength: 128 });
     const passwordInput = password.querySelector('input');
     passwordInput.autocomplete = setupRequired ? 'new-password' : 'current-password';
@@ -241,8 +264,8 @@ export async function renderAdmin(app) {
         return;
       }
       run(async () => {
-        const status = await api(setupRequired ? 'setup' : 'login', { method: 'POST', body: { password: passwordInput.value } });
-        if (!csrfToken) {
+        const status = await api(setupRequired ? 'setup' : 'login', { method: 'POST', body: { email: email?.value.trim(), password: passwordInput.value } });
+        if (!cloud && !csrfToken) {
           const refreshed = await api('status');
           csrfToken = refreshed.csrfToken || '';
         }
@@ -392,7 +415,7 @@ export async function renderAdmin(app) {
       if (!visibleWorks.length) throw new Error('Добавьте хотя бы одну видимую работу.');
       if (visibleWorks.some((work) => work.rightsConfirmed !== true)) throw new Error('Подтвердите право на публикацию у каждой видимой работы.');
       await saveDraft();
-      const published = unwrapArtist(await api(`admin/artists/${encodeURIComponent(draft.slug)}/publish`, { method: 'POST', body: {} }));
+      const published = unwrapArtist(await api(`admin/artists/${encodeURIComponent(draft.slug)}/publish`, { method: 'POST', body: { revision: draft.revision } }));
       if (published?.slug) draft = clone(published);
       else draft.published = true;
       updateArtistInList(draft);
@@ -403,7 +426,7 @@ export async function renderAdmin(app) {
       if (!window.confirm('Снять выставку с публикации? Она исчезнет из публичного поиска, черновик сохранится.')) return;
       run(async () => {
         await saveDraft();
-        const unpublished = unwrapArtist(await api(`admin/artists/${encodeURIComponent(draft.slug)}/unpublish`, { method: 'POST', body: {} }));
+        const unpublished = unwrapArtist(await api(`admin/artists/${encodeURIComponent(draft.slug)}/unpublish`, { method: 'POST', body: { revision: draft.revision } }));
         if (unpublished?.slug) draft = clone(unpublished);
         else draft.published = false;
         updateArtistInList(draft);
@@ -587,10 +610,10 @@ export async function renderAdmin(app) {
     if (!active || error.name === 'AbortError') return cleanup;
     body.replaceChildren();
     const unavailable = element('div', 'admin-login');
-    unavailable.append(element('h2', '', 'Мастерская недоступна'), element('p', '', 'Для входа администратора нужен сервер галереи. На статическом сайте GitHub Pages можно смотреть опубликованную коллекцию, но нельзя загружать и сохранять новые работы.'));
+    unavailable.append(element('h2', '', 'Мастерская недоступна'), element('p', '', cloud ? 'Проверьте подключение Supabase и настройку доступа администратора.' : 'Для входа администратора нужен сервер галереи.'));
     unavailable.append(button('Проверить подключение', () => location.reload()));
     body.append(unavailable);
-    message(error.status === 404 ? 'Серверная часть по этому адресу не найдена.' : 'Не удалось подключиться к серверу. Проверьте, что он запущен.', true);
+    message(cloud ? error.message : error.status === 404 ? 'Серверная часть по этому адресу не найдена.' : 'Не удалось подключиться к серверу. Проверьте, что он запущен.', true);
   }
   return cleanup;
 }

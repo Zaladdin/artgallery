@@ -1,6 +1,7 @@
 import { createRoomForArtworkCount } from "./gallery-config.js";
 import { mountArtworkViewer } from "./artwork-viewer.js";
 import { defaultArtists, fitArtwork } from './collection-data.js';
+import { isCloudMediaUrl, usesCloudGallery } from './supabase-config.js';
 
 let artists = defaultArtists;
 let artist = artists[0];
@@ -16,7 +17,22 @@ function escapeHtml(value = '') {
 }
 
 function mediaPath(source) {
+  if (isCloudMediaUrl(source)) return source;
   return typeof source === 'string' && /^(?:\.\/assets\/[a-z0-9/_-]+\.jpg|(?:\.\/|\/)media\/[a-z0-9-]+\/(?:full|scene|thumb)\.jpg)$/i.test(source) ? source : '';
+}
+
+function refreshCloudImageOnError(image) {
+  if (!image || !isCloudMediaUrl(image.src)) return;
+  const preview = route().startsWith('/preview/');
+  image.addEventListener('error', async () => {
+    try {
+      const { refreshCloudMedia } = await import('./supabase-gallery.js');
+      const replacement = await refreshCloudMedia(image.src, { preview });
+      if (image.isConnected && isCloudMediaUrl(replacement)) image.src = replacement;
+    } catch {
+      // Keep the alt text if the work was unpublished or storage is unreachable.
+    }
+  }, { once: true });
 }
 
 function prepareArtist(value) {
@@ -28,6 +44,10 @@ function prepareArtist(value) {
 }
 
 async function fetchArtists() {
+  if (usesCloudGallery()) {
+    const { cloudApi } = await import('./supabase-gallery.js');
+    return cloudApi('artists', { signal: AbortSignal.timeout(8000) });
+  }
   const response = await fetch('./api/artists', { signal: AbortSignal.timeout(5000), cache: 'no-store' });
   if (response.status === 404) {
     const snapshot = await fetch('./catalog.json', { signal: AbortSignal.timeout(5000), cache: 'no-store' });
@@ -334,6 +354,7 @@ function renderArtworkDialog(work) {
     </div>`;
   dialog.querySelector(".dialog-close").addEventListener("click", () => dialog.close());
   mountArtworkViewer(dialog);
+  refreshCloudImageOnError(dialog.querySelector('.art-viewport img'));
   dialog.querySelector('[data-share-art]').addEventListener('click', async () => {
     const url = new URL(location.href);
     url.hash = `${route()}?work=${encodeURIComponent(work.id)}`;
@@ -417,6 +438,7 @@ function renderGallery() {
   const closeListButton = document.querySelector("[data-close-list]");
   const lightSlider = document.querySelector("#room-light-level");
   const catalog = document.querySelector('#gallery-catalog');
+  document.querySelectorAll('.catalog-image img, .work-thumb').forEach(refreshCloudImageOnError);
   const notice = document.querySelector('.gallery-notice');
   const tourButton = document.querySelector('[data-tour]');
   const help = document.querySelector('#gallery-help');
@@ -543,9 +565,16 @@ async function renderRoute() {
     let selected;
     if (match[1] === 'preview') {
       try {
-        const response = await fetch('./api/admin/artists', { cache: 'no-store' });
-        if (!response.ok) throw new Error('Войдите в админку для предпросмотра.');
-        selected = (await response.json()).find((item) => item.slug === match[2]);
+        let drafts;
+        if (usesCloudGallery()) {
+          const { cloudApi } = await import('./supabase-gallery.js');
+          drafts = await cloudApi('admin/artists', { signal: AbortSignal.timeout(12000) });
+        } else {
+          const response = await fetch('./api/admin/artists', { cache: 'no-store' });
+          if (!response.ok) throw new Error('Войдите в админку для предпросмотра.');
+          drafts = await response.json();
+        }
+        selected = drafts.find((item) => item.slug === match[2]);
       } catch {
         if (revision !== routeRevision) return;
         disposeGalleryScene();
